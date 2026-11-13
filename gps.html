@@ -137,7 +137,9 @@ button:active{filter:brightness(1.35)}
 <div class="modal" id="mSave"><div class="box">
   <h2>Salva su Drive / File</h2>
   <p class="note" id="saveInfo"></p>
-  <button class="full" id="bGpx" style="background:#2d6cdf;border:0">⤴ Salva GPX (tracce + waypoint)</button>
+  <button class="full" id="bGpxSep" style="background:#2d6cdf;border:0">⤴ Salva ogni traccia in un file separato</button>
+  <div id="perTrack" style="display:grid;grid-template-columns:repeat(4,1fr);gap:6px"></div>
+  <button class="full" id="bGpx" style="background:#2b2e35">⤴ Tutto in un unico GPX</button>
   <button class="full" id="bZipPrep" style="background:#2b2e35">Prepara GPX + foto (ZIP)</button>
   <div id="zipOut"></div>
   <p class="note">Nel menu Condividi scegli <b>“Salva su File” → Google Drive</b>, oppure l’app <b>Drive</b>.</p>
@@ -425,28 +427,38 @@ function updateArrow(){
 /* ================= GPX export ================= */
 const esc=s=>String(s).replace(/[<>&"]/g,c=>({'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;'}[c]));
 function stampName(){const d=new Date();return `GPS_${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}_${pad(d.getHours())}${pad(d.getMinutes())}`;}
-function buildGPX(){
+function buildGPX(trackIdx=[0,1,2,3],withWpts=true){
   const iso=t=>new Date(t).toISOString();
   let s=`<?xml version="1.0" encoding="UTF-8"?>\n<gpx version="1.1" creator="GPS Intervento" xmlns="http://www.topografix.com/GPX/1/1">\n<metadata><time>${iso(Date.now())}</time></metadata>\n`;
-  wpts.filter(w=>w.lat!=null).forEach(w=>{const n=pad(w.num,3);s+=`<wpt lat="${w.lat.toFixed(7)}" lon="${w.lon.toFixed(7)}">${w.ele!=null?`<ele>${w.ele}</ele>`:''}<time>${iso(w.ts)}</time><name>${n}</name><desc>Foto WP ${n}</desc><link href="foto/WP${n}.jpg"><text>WP${n}.jpg</text></link><sym>Flag, Blue</sym></wpt>\n`;});
-  tracks.forEach(t=>{if(!t.pts.length)return;s+=`<trk><name>Traccia ${t.i+1}</name>\n`;const segs=[...new Set(t.pts.map(p=>p.seg))];segs.forEach(sg=>{s+='<trkseg>\n';t.pts.filter(p=>p.seg===sg).forEach(p=>{s+=`<trkpt lat="${p.lat.toFixed(7)}" lon="${p.lon.toFixed(7)}">${p.ele!=null?`<ele>${p.ele}</ele>`:''}<time>${iso(p.ts)}</time></trkpt>\n`;});s+='</trkseg>\n';});s+='</trk>\n';});
+  if(withWpts)wpts.filter(w=>w.lat!=null).forEach(w=>{const n=pad(w.num,3);s+=`<wpt lat="${w.lat.toFixed(7)}" lon="${w.lon.toFixed(7)}">${w.ele!=null?`<ele>${w.ele}</ele>`:''}<time>${iso(w.ts)}</time><name>${n}</name><desc>Foto WP ${n}</desc><link href="foto/WP${n}.jpg"><text>WP${n}.jpg</text></link><sym>Flag, Blue</sym></wpt>\n`;});
+  tracks.filter(t=>trackIdx.includes(t.i)).forEach(t=>{if(!t.pts.length)return;s+=`<trk><name>Traccia T${t.i+1}</name>\n`;const segs=[...new Set(t.pts.map(p=>p.seg))];segs.forEach(sg=>{s+='<trkseg>\n';t.pts.filter(p=>p.seg===sg).forEach(p=>{s+=`<trkpt lat="${p.lat.toFixed(7)}" lon="${p.lon.toFixed(7)}">${p.ele!=null?`<ele>${p.ele}</ele>`:''}<time>${iso(p.ts)}</time></trkpt>\n`;});s+='</trkseg>\n';});s+='</trk>\n';});
   return s+'</gpx>\n';
 }
-function shareFile(file){
-  const fallback=()=>{const a=document.createElement('a');a.href=URL.createObjectURL(file);a.download=file.name;document.body.appendChild(a);a.click();a.remove();};
-  try{if(navigator.canShare&&navigator.canShare({files:[file]})){navigator.share({files:[file],title:file.name}).catch(e=>{if(e&&e.name!=='AbortError')fallback();});return;}}catch(_){}
+/* un file GPX per ogni traccia registrata + uno per i waypoint */
+function separateFiles(){
+  const base=stampName(),files=[],gpxT='application/gpx+xml';
+  tracks.forEach(t=>{if(t.pts.length)files.push(new File([buildGPX([t.i],false)],`${base}_T${t.i+1}.gpx`,{type:gpxT}));});
+  if(wpts.some(w=>w.lat!=null))files.push(new File([buildGPX([],true)],`${base}_waypoint.gpx`,{type:gpxT}));
+  return files;
+}
+function shareFile(f){
+  const files=Array.isArray(f)?f:[f];if(!files.length){banner('Nessuna traccia da salvare',2000);return;}
+  const fallback=()=>files.forEach((file,i)=>setTimeout(()=>{const a=document.createElement('a');a.href=URL.createObjectURL(file);a.download=file.name;document.body.appendChild(a);a.click();a.remove();},i*400));
+  try{if(navigator.canShare&&navigator.canShare({files})){navigator.share({files,title:files.length>1?'Tracce GPS':files[0].name}).catch(e=>{if(e&&e.name!=='AbortError')fallback();});return;}}catch(_){}
   fallback();
 }
 $('#bSave').onclick=()=>{
   const np=tracks.reduce((s,t)=>s+t.pts.length,0);
   $('#saveInfo').textContent=`${tracks.filter(t=>t.pts.length).length} tracce (${np} punti) · ${wpts.length} waypoint/foto`;
+  const pt=$('#perTrack');pt.innerHTML='';tracks.forEach(t=>{const b=document.createElement('button');b.textContent='T'+(t.i+1);b.style.cssText=`border-left:5px solid ${COL[t.i]};padding:10px 4px;font-weight:700`;b.disabled=!t.pts.length;if(!t.pts.length)b.style.opacity=.35;b.onclick=()=>shareFile(new File([buildGPX([t.i],false)],`${stampName()}_T${t.i+1}.gpx`,{type:'application/gpx+xml'}));pt.appendChild(b);});
   $('#zipOut').innerHTML='';$('#bZipPrep').disabled=false;$('#bZipPrep').textContent='Prepara GPX + foto (ZIP)';modal('#mSave',true);
 };
-$('#bGpx').onclick=()=>{shareFile(new File([buildGPX()],stampName()+'.gpx',{type:'application/gpx+xml'}));};
+$('#bGpx').onclick=()=>{shareFile(new File([buildGPX()],stampName()+'_tutto.gpx',{type:'application/gpx+xml'}));};
+$('#bGpxSep').onclick=()=>shareFile(separateFiles());
 $('#bZipPrep').onclick=async()=>{
   const b=$('#bZipPrep');b.disabled=true;b.textContent='Preparazione…';
   const name=stampName(),z=new JSZip(),root=z.folder(name);
-  root.file(name+'.gpx',buildGPX());
+  root.file(name+'_tutto.gpx',buildGPX());separateFiles().forEach(f=>root.file('tracce/'+f.name.replace(stampName()+'_',''),f));
   const rows=['numero;data_ora;latitudine;longitudine;lat_DMS;lon_DMS;UTM;precisione_m;quota_m'];
   for(const w of wpts){const ph=await getOne('photos',w.num);if(ph&&ph.blob)root.file(`foto/WP${pad(w.num,3)}.jpg`,ph.blob,{binary:true});
     rows.push([pad(w.num,3),fmtDT(new Date(w.ts)),w.lat??'',w.lon??'',w.lat!=null?latDMS(w.lat):'',w.lon!=null?lonDMS(w.lon):'',w.lat!=null?utmStr(w).replace('\n',' '):'',w.acc??'',w.ele??''].join(';'));}
