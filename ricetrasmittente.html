@@ -1,0 +1,329 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#1d2418">
+<title>Ricetrasmittente</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=VT323&family=Barlow+Condensed:wght@500;700&display=swap" rel="stylesheet">
+<style>
+/* VOICE: attrezzo da campo, sobrio e robusto
+   IDEA: una ricetrasmittente portatile: display a cristalli liquidi, grande tasto PTT
+   PICTURE: il corpo della radio con il display e il tasto PARLA al centro
+   COLOUR/TYPE: verde oliva scuro, display ambra, rosso per la trasmissione; VT323 sul display, Barlow Condensed per il resto
+   LAYOUT: una colonna: display, destinatari, tasto PARLA, messaggi */
+:root{--body:#262e20;--body2:#1b2116;--edge:#3d4733;--lcd:#c8b46a;--lcdbg:#2a2b1c;--ink:#efe9d6;--mute:#a7a58f;--tx:#d93a2b;--ok:#7fb36a;--priv:#e0a43a}
+*{box-sizing:border-box;min-width:0}
+html,body{margin:0;height:100%}
+body{background:radial-gradient(ellipse at 50% 0%,#3a4530 0%,#161b12 70%);color:var(--ink);font:500 17px/1.4 "Barlow Condensed",system-ui,-apple-system,Arial,sans-serif;-webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:transparent;overflow-x:clip}
+.radio{max-width:460px;margin:0 auto;min-height:100%;padding:max(12px,env(safe-area-inset-top)) 14px max(16px,env(safe-area-inset-bottom));display:flex;flex-direction:column;gap:12px}
+.ant{height:22px;margin:0 0 -8px 34px;width:12px;border-radius:6px 6px 0 0;background:linear-gradient(90deg,#11140e,#3b4232,#11140e)}
+.case{background:linear-gradient(180deg,var(--body),var(--body2));border:2px solid var(--edge);border-radius:22px;padding:14px;box-shadow:0 14px 40px #000a,inset 0 1px 0 #ffffff14;display:flex;flex-direction:column;gap:12px;flex:1}
+.lcd{background:linear-gradient(180deg,#34351f,var(--lcdbg));border:3px solid #10130c;border-radius:10px;padding:8px 12px;font-family:VT323,ui-monospace,monospace;color:var(--lcd);text-shadow:0 0 6px #c8b46a55;box-shadow:inset 0 2px 8px #000c}
+.lcd .big{font-size:34px;line-height:1;letter-spacing:2px;display:flex;justify-content:space-between;gap:8px}
+.lcd .row{font-size:20px;line-height:1.15;display:flex;justify-content:space-between;gap:8px;white-space:nowrap;overflow:hidden}
+.lcd .row span:last-child{text-overflow:ellipsis;overflow:hidden}
+.dot{display:inline-block;width:10px;height:10px;border-radius:50%;background:#665;margin-right:6px;vertical-align:1px}
+.dot.on{background:var(--ok);box-shadow:0 0 8px var(--ok)}.dot.tx{background:var(--tx);box-shadow:0 0 10px var(--tx)}
+label{font-size:15px;color:var(--mute);letter-spacing:.5px}
+input{width:100%;font:500 19px "Barlow Condensed",system-ui,sans-serif;padding:11px 12px;border-radius:10px;border:2px solid var(--edge);background:#12160f;color:var(--ink);-webkit-user-select:text;user-select:text}
+input:focus{outline:none;border-color:var(--lcd)}
+#code{text-transform:uppercase;letter-spacing:4px;font-family:VT323,ui-monospace,monospace;font-size:26px}
+button{font:700 18px "Barlow Condensed",system-ui,sans-serif;letter-spacing:.5px;border:2px solid var(--edge);background:#343e2b;color:var(--ink);border-radius:12px;padding:11px 14px;min-height:46px;cursor:pointer;touch-action:manipulation}
+button:focus-visible{outline:3px solid var(--lcd);outline-offset:2px}
+button.pri{background:#c8b46a;color:#1b1d12;border-color:#e2d18c}
+.two{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px;align-items:end}
+.hint{font-size:15px;color:var(--mute);margin:0}
+.err{color:#ff8a7a;min-height:20px;font-size:15px;margin:0}
+.chips{display:flex;gap:7px;overflow-x:auto;padding-bottom:2px;scrollbar-width:none}
+.chips::-webkit-scrollbar{display:none}
+.chip{flex:none;min-height:40px;padding:6px 13px;border-radius:20px;font-size:17px;background:#1f261a}
+.chip.sel{background:var(--lcd);color:#1b1d12;border-color:#e2d18c}
+.chip.priv.sel{background:var(--priv);border-color:#f3c46e}
+.chip .tk{color:var(--tx);margin-left:4px}
+.ptt-wrap{display:flex;justify-content:center;padding:4px 0}
+#ptt{width:min(50vw,190px);aspect-ratio:1;border-radius:50%;border:6px solid #11140e;background:radial-gradient(circle at 45% 35%,#6b2a22,#3b1511 70%);color:#ffe9dc;font:700 30px "Barlow Condensed",system-ui,sans-serif;letter-spacing:2px;box-shadow:0 10px 0 #0d100a,0 16px 28px #000b,inset 0 2px 0 #ffffff22;touch-action:none;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:2px;transition:transform .06s}
+#ptt small{font-size:16px;font-weight:500;letter-spacing:.5px;opacity:.85;max-width:80%;line-height:1.1}
+#ptt.on{background:radial-gradient(circle at 45% 35%,#ff5a45,#b51f12 70%);transform:translateY(6px);box-shadow:0 4px 0 #0d100a,0 0 0 8px #d93a2b44,0 0 40px #d93a2b88}
+#ptt:disabled{opacity:.55}
+#log{background:#12160f;border:2px solid var(--edge);border-radius:12px;padding:8px 10px;height:clamp(90px,20vh,240px);overflow-y:auto;font-size:17px;-webkit-user-select:text;user-select:text}
+#log p{margin:0 0 5px}
+#log .who{color:var(--lcd);font-weight:700}
+#log .me .who{color:#9fd08a}
+#log .pv{color:var(--priv)}
+#log .sys{color:var(--mute);font-style:italic;font-size:15px}
+.send{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px}
+.bar{display:flex;gap:8px;flex-wrap:wrap}
+.bar button{flex:1;font-size:16px;min-height:42px}
+[hidden]{display:none!important}
+@media (prefers-reduced-motion:reduce){#ptt{transition:none}}
+</style>
+</head>
+<body>
+<div class="radio">
+  <div class="ant" aria-hidden="true"></div>
+  <div class="case">
+    <div class="lcd" aria-live="polite">
+      <div class="big"><span id="lcdCh">CH ----</span><span id="lcdN"></span></div>
+      <div class="row"><span><span class="dot" id="dot"></span><span id="lcdSt">SPENTA</span></span><span id="lcdTo"></span></div>
+      <div class="row"><span id="lcdRx">&nbsp;</span></div>
+    </div>
+
+    <section id="setup">
+      <div style="display:flex;flex-direction:column;gap:10px">
+        <div><label for="name">Il tuo nome</label><input id="name" maxlength="14" placeholder="es. Primo" autocomplete="off"></div>
+        <div class="two">
+          <div><label for="code">Codice canale</label><input id="code" maxlength="8" placeholder="ABCDE" autocomplete="off" autocapitalize="characters" spellcheck="false"></div>
+          <button class="pri" id="enter">ACCENDI</button>
+        </div>
+        <button id="newch">Crea un canale nuovo</button>
+        <p class="err" id="err"></p>
+        <p class="hint">Chi inserisce lo stesso codice è sullo stesso canale. Tieni premuto PARLA per trasmettere; per parlare con una persona sola toccane il nome. Funziona dal Wi-Fi e dai dati mobili, su telefono e computer.</p>
+      </div>
+    </section>
+
+    <section id="main" hidden style="display:flex;flex-direction:column;gap:12px">
+      <div class="chips" id="chips" role="group" aria-label="A chi trasmetti"></div>
+      <div class="ptt-wrap"><button id="ptt" aria-label="Tieni premuto per parlare">PARLA<small id="pttTo">a tutti</small></button></div>
+      <div id="log" aria-live="polite"></div>
+      <div class="send"><input id="msg" maxlength="200" placeholder="Scrivi un messaggio…" autocomplete="off" enterkeyhint="send"><button class="pri" id="sendBtn">INVIA</button></div>
+      <div class="bar"><button id="share">Invita (link)</button><button id="mute">🔊 Audio</button><button id="off">Spegni</button></div>
+      <p class="hint" id="kbHint">Al computer: tieni premuto la barra spaziazione per parlare.</p>
+    </section>
+  </div>
+</div>
+<script src="https://unpkg.com/mqtt@5.16.1/dist/mqtt.min.js"></script>
+<script>
+{
+'use strict';
+const $=id=>document.getElementById(id);
+const BROKERS=window.__RADIO_TEST_BROKERS||['wss://broker.emqx.io:8084/mqtt','wss://broker.hivemq.com:8884/mqtt'];
+const PFX='balbalu/rtx1/';
+const rid=()=>Math.random().toString(36).slice(2,10);
+const myId=rid()+rid();
+let name='', code='', H='', key=null, clients=[], members={}, target='*', muted=false, talking=false, stT=null, wake=null;
+const seen=new Set(), seenQ=[];
+let seq=0;
+
+// ---------- utilità ----------
+function cleanName(s){ return String(s||'').replace(/[\u0000-\u001f<>]/g,'').trim().slice(0,14)||'Anonimo'; }
+function normCode(s){ return String(s||'').toUpperCase().replace(/[^A-Z0-9]/g,'').slice(0,8); }
+function newCode(){ const C='ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; let s=''; for(let i=0;i<5;i++) s+=C[Math.floor(Math.random()*C.length)]; return s; }
+const enc=new TextEncoder(), dec=new TextDecoder();
+function b64(u8){ let s=''; for(let i=0;i<u8.length;i+=4096) s+=String.fromCharCode.apply(null,u8.subarray(i,i+4096)); return btoa(s); }
+function unb64(s){ const b=atob(s), a=new Uint8Array(b.length); for(let i=0;i<b.length;i++) a[i]=b.charCodeAt(i); return a; }
+async function sha(s){ const h=await crypto.subtle.digest('SHA-256',enc.encode(s)); return Array.from(new Uint8Array(h)).map(x=>x.toString(16).padStart(2,'0')).join(''); }
+async function deriveKey(c){
+  const base=await crypto.subtle.importKey('raw',enc.encode('balbalu-radio|'+c),'PBKDF2',false,['deriveKey']);
+  return crypto.subtle.deriveKey({name:'PBKDF2',salt:enc.encode('ricetrasmittente-v1'),iterations:60000,hash:'SHA-256'},base,{name:'AES-GCM',length:256},false,['encrypt','decrypt']);
+}
+async function seal(o){ const iv=crypto.getRandomValues(new Uint8Array(12)); const ct=new Uint8Array(await crypto.subtle.encrypt({name:'AES-GCM',iv},key,enc.encode(JSON.stringify(o)))); const all=new Uint8Array(12+ct.length); all.set(iv); all.set(ct,12); return b64(all); }
+async function open_(s){ const all=unb64(s); const pt=await crypto.subtle.decrypt({name:'AES-GCM',iv:all.subarray(0,12)},key,all.subarray(12)); return JSON.parse(dec.decode(pt)); }
+
+// ---------- collegamento (server MQTT pubblici, messaggi cifrati col codice canale) ----------
+function topicAll(){ return PFX+H+'/all'; }
+function topicMe(){ return PFX+H+'/u/'+myId; }
+function topicTo(id){ return PFX+H+'/u/'+id; }
+function connect(){
+  if(!window.mqtt){ setErr('Nessuna connessione a Internet: riprova.'); return false; }
+  clients=BROKERS.map(u=>{
+    let c; try{ c=mqtt.connect(u,{clientId:'rtx'+rid()+rid(),keepalive:30,reconnectPeriod:4000,connectTimeout:10000,clean:true}); }catch(e){ return null; }
+    c.on('connect',()=>{ c.subscribe([topicAll(),topicMe()],{qos:0}); announce(); paint(); });
+    c.on('close',paint); c.on('error',()=>{});
+    c.on('message',(t,p)=>onMsg(t,p));
+    return c;
+  }).filter(Boolean);
+  return true;
+}
+function online(){ return clients.some(c=>c.connected); }
+async function pub(topic,o){
+  if(!key) return;
+  o.id=myId; o.n=name; o._m=myId+':'+(++seq);
+  let s; try{ s=await seal(o); }catch(e){ return; }
+  clients.forEach(c=>{ if(c.connected) try{ c.publish(topic,s,{qos:0}); }catch(e){} });
+}
+async function onMsg(t,p){
+  let o; try{ o=await open_(typeof p==='string'?p:dec.decode(p)); }catch(e){ return; }
+  if(!o||typeof o!=='object'||typeof o.id!=='string'||o.id===myId) return;
+  if(typeof o._m==='string'){ if(seen.has(o._m)) return; seen.add(o._m); seenQ.push(o._m); if(seenQ.length>4000) seen.delete(seenQ.shift()); }
+  const priv=t!==topicAll();
+  const m=members[o.id]||(members[o.id]={n:'',last:0,tk:0,tkTo:'*',next:0,heard:0});
+  const wasNew=!m.last;
+  m.last=Date.now(); m.n=cleanName(o.n);
+  if(o.t==='st'){ if(wasNew) sys(m.n+' è sul canale'); }
+  else if(o.t==='bye'){ sys(m.n+' ha spento la radio'); delete members[o.id]; }
+  else if(o.t==='tx'&&typeof o.x==='string'){ line(m.n,o.x.slice(0,200),priv,false); beep(1200,.05,.05); }
+  else if(o.t==='k'){ m.tk=o.on?1:0; m.tkTo=priv?'me':'*'; if(o.on) chirp(true); else chirp(false); }
+  else if(o.t==='a'&&typeof o.d==='string'){ m.heard=Date.now(); m.tkTo=priv?'me':'*'; playChunk(m,o.d); }
+  paint();
+}
+function announce(){ if(key) pub(topicAll(),{t:'st'}); expire(); paint(); }
+function expire(){ const t=Date.now(); for(const id in members) if(t-members[id].last>9000){ sys(members[id].n+' non si sente più'); delete members[id]; if(target===id) target='*'; } }
+
+// ---------- audio (8000 Hz mu-law, pacchetti da 200 ms) ----------
+let AC=null, stream=null, proc=null, srcNode=null, sink=null, buf=[], pos=0;
+function ensureAC(){ if(!AC){ const C=window.AudioContext||window.webkitAudioContext; if(!C) return null; AC=new C(); } if(AC.state==='suspended') AC.resume(); return AC; }
+function muEnc(x){ let s=x<0?0x80:0; if(x<0) x=-x; if(x>1) x=1; const v=Math.min(32635,Math.floor(x*32767))+132; let e=7; for(let m=0x4000;(v&m)===0&&e>0;m>>=1) e--; const man=(v>>(e+3))&0x0F; return ~(s|(e<<4)|man)&0xFF; }
+const MU=new Float32Array(256); for(let i=0;i<256;i++){ const u=~i&0xFF, s=u&0x80, e=(u>>4)&7, m=u&0x0F; let v=((m<<3)+132)<<e; v-=132; MU[i]=(s?-v:v)/32768; }
+async function micReady(){
+  if(stream) return true;
+  if(!navigator.mediaDevices||!navigator.mediaDevices.getUserMedia){ sys('Questo browser non permette il microfono.'); return false; }
+  try{ stream=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:true,noiseSuppression:true,autoGainControl:true},video:false}); }
+  catch(e){ sys('Microfono non consentito: puoi comunque ascoltare e scrivere.'); return false; }
+  const ac=ensureAC();
+  srcNode=ac.createMediaStreamSource(stream); proc=ac.createScriptProcessor(4096,1,1); sink=ac.createGain(); sink.gain.value=0;
+  srcNode.connect(proc); proc.connect(sink); sink.connect(ac.destination);
+  const ratio=ac.sampleRate/8000;
+  proc.onaudioprocess=ev=>{
+    if(!talking){ pos=0; return; }
+    const inp=ev.inputBuffer.getChannelData(0), n=inp.length;
+    while(pos<n){ const a=Math.floor(pos), b=Math.min(n,Math.floor(pos+ratio)); let sum=0,c=0; for(let i=a;i<b;i++){ sum+=inp[i]; c++; } buf.push(muEnc(c?sum/c:(inp[a]||0))); pos+=ratio; }
+    pos-=n; if(buf.length>=1600) flush();
+  };
+  return true;
+}
+function dest(){ return target==='*'?topicAll():topicTo(target); }
+function flush(){ if(!buf.length) return; const u=new Uint8Array(buf); buf=[]; pub(dest(),{t:'a',d:b64(u)}); }
+function playChunk(m,d){
+  if(muted) return;
+  const ac=ensureAC(); if(!ac||ac.state!=='running'){ needTap(); return; }
+  let bytes; try{ bytes=unb64(d); }catch(e){ return; }
+  if(!bytes.length||bytes.length>8000) return;
+  const sr=ac.sampleRate, len=Math.floor(bytes.length*sr/8000), out=ac.createBuffer(1,len,sr), ch=out.getChannelData(0), k=8000/sr;
+  for(let i=0;i<len;i++){ const p=i*k, j=Math.floor(p), f=p-j, x0=MU[bytes[j]], x1=MU[bytes[Math.min(bytes.length-1,j+1)]]; ch[i]=(x0+(x1-x0)*f)*1.6; }
+  const s=ac.createBufferSource(); s.buffer=out; s.connect(ac.destination);
+  const t=ac.currentTime; if(m.next<t+0.05||m.next>t+1.2) m.next=t+0.25;
+  try{ s.start(m.next); }catch(e){} m.next+=out.duration;
+}
+function beep(f,d,v){ if(muted) return; const ac=ensureAC(); if(!ac) return; try{ const o=ac.createOscillator(), g=ac.createGain(), t=ac.currentTime; o.frequency.value=f; g.gain.setValueAtTime(v,t); g.gain.exponentialRampToValueAtTime(0.0001,t+d); o.connect(g); g.connect(ac.destination); o.start(t); o.stop(t+d+0.02); }catch(e){} }
+function chirp(on){ if(on){ beep(1400,.06,.06); } else { beep(900,.08,.06); setTimeout(()=>beep(700,.1,.05),90); } }
+let tapWarned=false;
+function needTap(){ if(tapWarned) return; tapWarned=true; $('lcdRx').textContent='TOCCA LO SCHERMO PER SENTIRE'; }
+addEventListener('pointerdown',()=>{ if(AC&&AC.state!=='running') AC.resume(); tapWarned=false; },true);
+
+// ---------- trasmissione ----------
+async function startTalk(){
+  if(talking||!key) return;
+  ensureAC();
+  if(!(await micReady())) return;
+  talking=true; buf=[]; pos=0; chirp(true);
+  pub(dest(),{t:'k',on:1}); paint();
+  try{ if(navigator.vibrate) navigator.vibrate(30); }catch(e){}
+}
+function stopTalk(){
+  if(!talking) return;
+  talking=false; flush(); pub(dest(),{t:'k',on:0}); chirp(false); paint();
+}
+const ptt=$('ptt');
+ptt.addEventListener('pointerdown',e=>{ e.preventDefault(); try{ ptt.setPointerCapture(e.pointerId); }catch(x){} startTalk(); });
+['pointerup','pointercancel','lostpointercapture'].forEach(ev=>ptt.addEventListener(ev,e=>{ e.preventDefault(); stopTalk(); }));
+ptt.addEventListener('contextmenu',e=>e.preventDefault());
+const typing=e=>e.target&&(e.target.tagName==='INPUT'||e.target.tagName==='TEXTAREA');
+addEventListener('keydown',e=>{ if((e.code==='Space'||e.code==='KeyN')&&!typing(e)&&!$('main').hidden&&!e.repeat){ e.preventDefault(); startTalk(); } });
+addEventListener('keyup',e=>{ if(e.code==='Space'||e.code==='KeyN') stopTalk(); });
+addEventListener('blur',stopTalk);
+document.addEventListener('visibilitychange',()=>{ if(document.hidden) stopTalk(); });
+
+// ---------- messaggi scritti ----------
+function line(who,text,priv,me){
+  const p=document.createElement('p'); if(me) p.className='me';
+  const w=document.createElement('span'); w.className='who'; w.textContent=who+(priv?' 🔒':'')+': ';
+  const x=document.createElement('span'); if(priv) x.className='pv'; x.textContent=text;
+  p.append(w,x); addLog(p);
+}
+function sys(text){ const p=document.createElement('p'); p.className='sys'; p.textContent=text; addLog(p); }
+function addLog(p){ const L=$('log'); L.appendChild(p); while(L.children.length>150) L.firstChild.remove(); L.scrollTop=L.scrollHeight; }
+function sendText(){
+  const x=$('msg').value.replace(/[\u0000-\u001f]/g,' ').trim().slice(0,200); if(!x||!key) return;
+  $('msg').value='';
+  pub(dest(),{t:'tx',x});
+  line(name+(target==='*'?'':' → '+(members[target]?members[target].n:'?')),x,target!=='*',true);
+}
+$('sendBtn').onclick=sendText;
+$('msg').addEventListener('keydown',e=>{ if(e.key==='Enter'){ e.preventDefault(); sendText(); } });
+
+// ---------- schermo ----------
+function paint(){
+  const on=online();
+  $('dot').className='dot'+(talking?' tx':(on?' on':''));
+  $('lcdSt').textContent=!key?'SPENTA':(talking?'IN TRASMISSIONE':(on?'IN ASCOLTO':'COLLEGAMENTO…'));
+  const n=Object.keys(members).length;
+  $('lcdN').textContent=key?(n+1)+'P':'';
+  $('lcdCh').textContent='CH '+(code||'----');
+  const tn=target==='*'?'A TUTTI':'A '+(members[target]?members[target].n.toUpperCase():'?');
+  $('lcdTo').textContent=key?tn:'';
+  const t=Date.now(), rx=[];
+  for(const id in members){ const m=members[id]; if(m.tk||t-m.heard<700) rx.push(m.n+(m.tkTo==='me'?' (a te)':'')); }
+  if(!tapWarned) $('lcdRx').textContent=rx.length?'◄ '+rx.join(', ').toUpperCase():(key?'NESSUNO PARLA':' ');
+  ptt.className=talking?'on':'';
+  $('pttTo').textContent=target==='*'?'a tutti':'solo a '+(members[target]?members[target].n:'?');
+  // destinatari
+  const C=$('chips'), ids=Object.keys(members).sort((a,b)=>members[a].n.localeCompare(members[b].n));
+  const sig=target+'|'+ids.map(id=>id+members[id].n+(members[id].tk||t-members[id].heard<700?1:0)).join(',');
+  if(C.dataset.sig!==sig){
+    C.dataset.sig=sig; C.innerHTML='';
+    const mk=(id,label,priv,tk)=>{ const b=document.createElement('button'); b.className='chip'+(priv?' priv':'')+(target===id?' sel':''); b.textContent=label; if(tk){ const s=document.createElement('span'); s.className='tk'; s.textContent='●'; b.appendChild(s); } b.setAttribute('aria-pressed',target===id?'true':'false'); b.onclick=()=>{ stopTalk(); target=id; paint(); }; C.appendChild(b); };
+    mk('*','📢 Tutti',false,false);
+    ids.forEach(id=>mk(id,'🔒 '+members[id].n,true,members[id].tk||t-members[id].heard<700));
+    if(!ids.length){ const s=document.createElement('span'); s.className='hint'; s.style.alignSelf='center'; s.textContent='In attesa di altri sul canale…'; C.appendChild(s); }
+  }
+}
+setInterval(paint,400);
+function setErr(t){ $('err').textContent=t||''; }
+
+// ---------- accensione ----------
+async function powerOn(){
+  setErr('');
+  name=cleanName($('name').value); $('name').value=name;
+  code=normCode($('code').value); $('code').value=code;
+  if(code.length<4){ setErr('Scrivi un codice canale di almeno 4 caratteri, oppure creane uno nuovo.'); return; }
+  if(!window.crypto||!crypto.subtle){ setErr('Apri la radio dal link https (GitHub), non dal file.'); return; }
+  ensureAC();
+  $('enter').disabled=true; $('enter').textContent='…';
+  try{ key=await deriveKey(code); H=(await sha('balbalu-radio-ch|'+code)).slice(0,24); }
+  catch(e){ setErr('Errore: '+e.message); $('enter').disabled=false; $('enter').textContent='ACCENDI'; return; }
+  try{ localStorage.setItem('rtx_name',name); localStorage.setItem('rtx_code',code); }catch(e){}
+  members={}; target='*';
+  if(!connect()){ key=null; $('enter').disabled=false; $('enter').textContent='ACCENDI'; return; }
+  $('setup').hidden=true; $('main').hidden=false; $('log').innerHTML='';
+  sys('Canale '+code+': tieni premuto PARLA per trasmettere.');
+  $('kbHint').hidden=matchMedia('(pointer:coarse)').matches;
+  stT=setInterval(announce,3000);
+  try{ if(navigator.wakeLock) wake=await navigator.wakeLock.request('screen'); }catch(e){}
+  try{ history.replaceState(null,'','?canale='+code); }catch(e){}
+  paint();
+}
+function powerOff(){
+  stopTalk();
+  if(key) pub(topicAll(),{t:'bye'});
+  setTimeout(()=>{ clients.forEach(c=>{ try{ c.end(true); }catch(e){} }); clients=[]; },300);
+  clearInterval(stT); key=null; members={};
+  if(stream){ stream.getTracks().forEach(t=>t.stop()); stream=null; try{ proc.disconnect(); srcNode.disconnect(); sink.disconnect(); }catch(e){} }
+  try{ if(wake) wake.release(); }catch(e){} wake=null;
+  $('main').hidden=true; $('setup').hidden=false; $('enter').disabled=false; $('enter').textContent='ACCENDI';
+  paint();
+}
+$('enter').onclick=powerOn;
+$('code').addEventListener('keydown',e=>{ if(e.key==='Enter') powerOn(); });
+$('newch').onclick=()=>{ $('code').value=newCode(); powerOn(); };
+$('off').onclick=powerOff;
+$('mute').onclick=()=>{ muted=!muted; $('mute').textContent=muted?'🔇 Muto':'🔊 Audio'; };
+$('share').onclick=async()=>{
+  const url=location.origin+location.pathname+'?canale='+code;
+  const text='Accendi la ricetrasmittente, canale '+code+': '+url;
+  try{ if(navigator.share){ await navigator.share({title:'Ricetrasmittente',text,url}); return; } }catch(e){ return; }
+  try{ await navigator.clipboard.writeText(url); sys('Link copiato: '+url); }catch(e){ sys('Manda questo link: '+url); }
+};
+addEventListener('pagehide',()=>{ if(key) pub(topicAll(),{t:'bye'}); });
+document.addEventListener('visibilitychange',async()=>{ if(!document.hidden&&key&&!wake&&navigator.wakeLock){ try{ wake=await navigator.wakeLock.request('screen'); }catch(e){} } });
+
+// precompila
+try{ $('name').value=localStorage.getItem('rtx_name')||''; $('code').value=localStorage.getItem('rtx_code')||''; }catch(e){}
+const q=new URLSearchParams(location.search).get('canale'); if(q) $('code').value=normCode(q);
+paint();
+window.__rtx={st:()=>({key:!!key,online:online(),members:Object.fromEntries(Object.entries(members).map(([k,v])=>[k,{n:v.n,heard:Date.now()-v.heard,tk:v.tk}])),target,talking,log:$('log').innerText})};
+}
+</script>
+</body>
+</html>

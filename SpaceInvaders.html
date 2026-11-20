@@ -1,0 +1,414 @@
+<!doctype html><html lang="it"><meta charset="utf-8">
+<script>
+/* RETE DI RISERVA + RADIO DI SQUADRA — modulo comune ai giochi online di balbalu-bot.
+   1) Se il collegamento diretto tra due dispositivi non parte (tipico: telefono con i dati
+      mobili), la partita passa da sola su un server pubblico (MQTT) che fa da ponte.
+   2) Radio "premi e parla": la voce viaggia sullo stesso server, quindi funziona da qualsiasi rete.
+   Il gioco non viene modificato: il modulo si aggancia a PeerJS e, se qualcosa va storto, si spegne. */
+(function(){
+  'use strict';
+  if(window.__radioSquadra) return; window.__radioSquadra=1;
+
+  var BROKERS=window.__RADIO_TEST_BROKERS||['wss://broker.emqx.io:8084/mqtt','wss://broker.hivemq.com:8884/mqtt'];
+  var MQTT_URL=window.__RADIO_TEST_MQTT||'https://unpkg.com/mqtt@5.16.1/dist/mqtt.min.js';
+  var PFX='balbalu/rr1/', TALK_KEY='KeyN', FALLBACK_MS=7000;
+  function rid(){ return Math.random().toString(36).slice(2,10); }
+  function tclean(s){ return String(s||'').replace(/[^A-Za-z0-9_.-]/g,'_').slice(0,80); }
+  function nowMs(){ return Date.now(); }
+
+  // ================= 1. server ponte (MQTT) =================
+  var R={clients:[],subs:{},loading:false,seen:{},seenQ:[],seq:0,id:rid()+rid()};
+  function relayStart(){
+    if(R.clients.length||R.loading) return;
+    if(window.mqtt&&window.mqtt.connect){ connectAll(); return; }
+    R.loading=true;
+    var s=document.createElement('script'); s.src=MQTT_URL;
+    s.onload=function(){ R.loading=false; if(window.mqtt&&window.mqtt.connect) connectAll(); };
+    s.onerror=function(){ R.loading=false; };
+    (document.head||document.documentElement).appendChild(s);
+  }
+  function connectAll(){
+    BROKERS.forEach(function(u){
+      var c; try{ c=window.mqtt.connect(u,{clientId:'bb'+rid()+rid(),keepalive:30,reconnectPeriod:4000,connectTimeout:10000,clean:true}); }catch(e){ return; }
+      c.on('connect',function(){ Object.keys(R.subs).forEach(function(t){ try{ c.subscribe(t,{qos:0}); }catch(e){} }); render(); });
+      c.on('message',function(t,p){ onRelayMsg(t,p); });
+      c.on('error',function(){}); c.on('close',function(){ render(); });
+      R.clients.push(c);
+    });
+  }
+  function relayUp(){ for(var i=0;i<R.clients.length;i++) if(R.clients[i].connected) return true; return false; }
+  function rsub(t,fn){ t=PFX+t; R.subs[t]=fn; relayStart(); R.clients.forEach(function(c){ if(c.connected) try{ c.subscribe(t,{qos:0}); }catch(e){} }); }
+  function runsub(t){ t=PFX+t; delete R.subs[t]; R.clients.forEach(function(c){ try{ c.unsubscribe(t); }catch(e){} }); }
+  function rpub(t,o){
+    relayStart(); o._m=R.id+':'+(++R.seq);
+    var s; try{ s=JSON.stringify(o); }catch(e){ return; }
+    R.clients.forEach(function(c){ if(c.connected) try{ c.publish(PFX+t,s,{qos:0}); }catch(e){} });
+  }
+  var TD=(typeof TextDecoder!=='undefined')?new TextDecoder():null;
+  function onRelayMsg(t,p){
+    var fn=R.subs[t]; if(!fn) return;
+    var o; try{ o=JSON.parse(typeof p==='string'?p:(TD?TD.decode(p):String(p))); }catch(e){ return; }
+    if(!o||typeof o!=='object') return;
+    var m=o._m;
+    if(typeof m==='string'){ if(R.seen[m]) return; R.seen[m]=1; R.seenQ.push(m); if(R.seenQ.length>4000) delete R.seen[R.seenQ.shift()]; }
+    try{ fn(o); }catch(e){ setTimeout(function(){ throw e; }); }
+  }
+
+  // piccolo gestore di eventi, compatibile con quello di PeerJS
+  function Em(){ this._ev={}; }
+  Em.prototype.on=function(e,f){ (this._ev[e]=this._ev[e]||[]).push(f); return this; };
+  Em.prototype.addListener=Em.prototype.on;
+  Em.prototype.once=function(e,f){ var me=this; function g(){ me.off(e,g); return f.apply(me,arguments); } g._f=f; return this.on(e,g); };
+  Em.prototype.off=function(e,f){ var a=this._ev[e]; if(!a) return this; if(!f){ delete this._ev[e]; return this; } this._ev[e]=a.filter(function(x){ return x!==f&&x._f!==f; }); return this; };
+  Em.prototype.removeListener=Em.prototype.off;
+  Em.prototype.removeAllListeners=function(e){ if(e) delete this._ev[e]; else this._ev={}; return this; };
+  Em.prototype.listenerCount=function(e){ return (this._ev[e]||[]).length; };
+  Em.prototype.listeners=function(e){ return (this._ev[e]||[]).slice(); };
+  Em.prototype.emit=function(e){
+    var a=(this._ev[e]||[]).slice(), args=[].slice.call(arguments,1), me=this;
+    a.forEach(function(f){ try{ f.apply(me,args); }catch(x){ setTimeout(function(){ throw x; }); } });
+    return a.length>0;
+  };
+
+  var relayNote=0;
+  function noteRelay(){ relayNote=nowMs(); render(); setTimeout(render,6000); }
+
+  // --- lato di chi entra: collegamento "doppio" (diretto, altrimenti ponte) ---
+  function XConn(provider,target,opts){
+    Em.call(this); opts=opts||{};
+    this.peer=target; this.provider=provider; this.open=false; this.type='data';
+    this.label=opts.label||('dc_'+rid()); this.metadata=opts.metadata; this.serialization=opts.serialization||'binary'; this.reliable=!!opts.reliable;
+    this.mode='real'; this.real=null; this.closed=false; this.noRelay=false; this.__radioProxy=true;
+  }
+  XConn.prototype=Object.create(Em.prototype);
+  XConn.prototype.attach=function(real){
+    var me=this; me.real=real;
+    real.on('open',function(){ if(me.mode!=='real'||me.closed) return; clearTimeout(me.fbT); me.open=true; me.emit('open'); });
+    real.on('data',function(d){ if(me.mode==='real'&&!me.closed) me.emit('data',d); });
+    real.on('close',function(){ if(me.mode!=='real'||me.closed) return; if(me.open||me.noRelay) me._end(); else me.toRelay(); });
+    real.on('error',function(e){ if(me.mode!=='real'||me.closed) return; if(me.open) me.emit('error',e); else if(!me.noRelay) me.toRelay(); });
+    me.fbT=setTimeout(function(){ if(!me.open&&me.mode==='real'&&!me.closed&&!me.noRelay) me.toRelay(); },FALLBACK_MS);
+  };
+  XConn.prototype.toRelay=function(){
+    var me=this; if(me.mode==='relay'||me.closed||me.noRelay) return;
+    me.mode='relay'; clearTimeout(me.fbT);
+    try{ if(me.real) me.real.close(); }catch(e){}
+    me.gid=tclean(me.provider.id||('g'+rid())); me.cid=rid(); me.hostT='h/'+tclean(me.peer); me.inT='g/'+me.gid+'/'+me.cid;
+    rsub(me.inT,function(o){ me._msg(o); });
+    var tries=0;
+    (function hello(){
+      if(me.open||me.closed) return;
+      if(++tries>24){ me.emit('error',{type:'peer-unavailable',message:'Collegamento non riuscito'}); me._end(); return; }
+      rpub(me.hostT,{t:'hello',from:me.gid,cid:me.cid});
+      me.helloT=setTimeout(hello,1500);
+    })();
+  };
+  XConn.prototype._msg=function(o){
+    var me=this; if(me.closed) return; me.last=nowMs();
+    if(o.t==='ack'&&!me.open){
+      me.open=true; clearTimeout(me.helloT); noteRelay(); me.emit('open');
+      me.pingT=setInterval(function(){ if(nowMs()-me.last>16000){ me._end(); return; } rpub(me.hostT,{t:'p',from:me.gid,cid:me.cid}); },4000);
+    } else if(o.t==='d'&&me.open) me.emit('data',o.d);
+    else if(o.t==='bye') me._end();
+  };
+  XConn.prototype.send=function(d){
+    if(this.closed) return;
+    if(this.mode==='real'){ if(this.real) return this.real.send(d); }
+    else if(this.open) rpub(this.hostT,{t:'d',from:this.gid,cid:this.cid,d:d});
+  };
+  XConn.prototype.close=function(){
+    if(this.closed) return;
+    if(this.mode==='real'){ try{ if(this.real) this.real.close(); }catch(e){} }
+    else rpub(this.hostT,{t:'bye',from:this.gid,cid:this.cid});
+    this._end();
+  };
+  XConn.prototype._end=function(){
+    if(this.closed) return; this.closed=true; this.open=false;
+    clearTimeout(this.fbT); clearTimeout(this.helloT); clearInterval(this.pingT);
+    if(this.inT) runsub(this.inT);
+    this.emit('close');
+  };
+  Object.defineProperty(XConn.prototype,'dataChannel',{get:function(){ return this.real&&this.mode==='real'?this.real.dataChannel:null; }});
+  Object.defineProperty(XConn.prototype,'peerConnection',{get:function(){ return this.real&&this.mode==='real'?this.real.peerConnection:null; }});
+
+  // --- lato di chi crea la stanza: accetta anche chi arriva dal ponte ---
+  function HConn(host,from,cid){
+    Em.call(this); this.peer=from; this.cid=cid; this.provider=host; this.open=false; this.closed=false; this.type='data';
+    this.label='relay_'+cid; this.serialization='json'; this.reliable=true; this.__relayH=true; this.outT='g/'+tclean(from)+'/'+cid; this.last=nowMs();
+    var me=this;
+    this.pingT=setInterval(function(){ if(nowMs()-me.last>16000){ me._end(); return; } rpub(me.outT,{t:'p'}); },4000);
+  }
+  HConn.prototype=Object.create(Em.prototype);
+  HConn.prototype.send=function(d){ if(this.open&&!this.closed) rpub(this.outT,{t:'d',d:d}); };
+  HConn.prototype.close=function(){ if(this.closed) return; rpub(this.outT,{t:'bye'}); this._end(); };
+  HConn.prototype._end=function(){
+    if(this.closed) return; this.closed=true; this.open=false; clearInterval(this.pingT);
+    var rh=this.provider.__rh; if(rh&&rh.conns[this.cid]===this) delete rh.conns[this.cid];
+    this.emit('close');
+  };
+  function relayHost(p,superEmit){
+    if(p.__rh||!p.id) return;
+    var rh=p.__rh={conns:{},topic:'h/'+tclean(p.id)};
+    rsub(rh.topic,function(o){
+      if(p.destroyed||typeof o.cid!=='string'||typeof o.from!=='string') return;
+      var c=rh.conns[o.cid];
+      if(o.t==='hello'){
+        if(!c){
+          c=new HConn(p,o.from,o.cid); rh.conns[o.cid]=c;
+          superEmit('connection',c);
+          setTimeout(function(){ if(!c.closed){ c.open=true; noteRelay(); c.emit('open'); } },0);
+        }
+        rpub(c.outT,{t:'ack'});
+      } else if(c){
+        c.last=nowMs();
+        if(o.t==='d'&&c.open) c.emit('data',o.d);
+        else if(o.t==='bye') c._end();
+      }
+    });
+  }
+  function relayHostStop(p){
+    var rh=p.__rh; if(!rh) return; p.__rh=null; runsub(rh.topic);
+    for(var k in rh.conns){ try{ rh.conns[k].close(); }catch(e){} }
+  }
+
+  // ================= 2. aggancio a PeerJS =================
+  var chan='', chanOwner=null;
+  function noteChannel(id,owner){
+    if(typeof id!=='string'||!id) return;
+    if(chan===id){ chanOwner=owner||chanOwner; return; }
+    leaveChannel(); chan=id; chanOwner=owner||null; joinChannel();
+  }
+  function wrap(P){
+    if(typeof P!=='function'||P.__radioWrapped) return P;
+    var W;
+    try{
+      W=class extends P{
+        constructor(){
+          super(...arguments);
+          var me=this, fixed=(typeof arguments[0]==='string')?arguments[0]:null;
+          me.__proxies=[];
+          try{
+            if(fixed) me.on('open',function(){ relayHost(me,function(ev,a){ return P.prototype.emit.call(me,ev,a); }); if(!me.__radioGuest) noteChannel(fixed,me); });
+            me.on('connection',function(){ if(!me.__radioGuest&&me.id) noteChannel(me.id,me); });
+          }catch(e){}
+        }
+        connect(id,opts){
+          this.__radioGuest=true;
+          try{ noteChannel(id,this); }catch(e){}
+          var real=super.connect.apply(this,arguments);
+          if(!real||typeof real.on!=='function') return real;
+          var x=new XConn(this,id,opts); x.attach(real); this.__proxies.push(x);
+          return x;
+        }
+        emit(ev,a){
+          // chi crea la stanza vede un collegamento diretto solo quando è davvero aperto:
+          // se non si apre, il gioco non lo vede e l'altro arriva dal ponte
+          if(ev==='connection'&&a&&!a.__relayH&&!a.open&&typeof a.on==='function'){
+            var done=false;
+            a.on('open',()=>{ if(done) return; done=true; super.emit('connection',a); setTimeout(function(){ try{ a.emit('open'); }catch(e){} },0); });
+            return true;
+          }
+          if(ev==='error'&&a&&a.type==='peer-unavailable'&&this.__proxies){
+            this.__proxies.forEach(function(x){ if(!x.open){ x.noRelay=true; clearTimeout(x.fbT); } });
+          }
+          return super.emit.apply(this,arguments);
+        }
+        destroy(){
+          try{ relayHostStop(this); }catch(e){}
+          try{ (this.__proxies||[]).forEach(function(x){ x.close(); }); }catch(e){}
+          try{ if(chanOwner===this) setTimeout(function(){ if(chanOwner&&chanOwner.destroyed) leaveChannel(); },0); }catch(e){}
+          return super.destroy.apply(this,arguments);
+        }
+      };
+      W.__radioWrapped=true;
+    }catch(e){ return P; }
+    return W;
+  }
+  try{
+    var cur=window.Peer;
+    if(cur) cur=wrap(cur);
+    Object.defineProperty(window,'Peer',{configurable:true,enumerable:true,
+      get:function(){ return cur; },
+      set:function(v){ if(window.__RADIO_TEST_PEER) v=window.__RADIO_TEST_PEER; cur=wrap(v); }});
+  }catch(e){}
+
+  // ================= 3. radio: presenze e voce sul ponte =================
+  var myId=rid()+rid(), members={}, micStream=null, talking=false, status='', needTap=false, stT=null;
+  function chanT(){ return 'r/'+tclean(chan); }
+  var lastName='';
+  document.addEventListener('input',function(e){ var t=e.target; if(t&&t.matches&&t.matches('#nickname,#name,#nome,#nick,#playerName,#nm,#cs')) lastName=String(t.value||''); },true);
+  function myName(){
+    var el=document.querySelector('#nickname,#name,#nome,#nick,#playerName,#nm,#cs');
+    var v=el&&el.value?String(el.value).trim():(lastName||'').trim();
+    if(!v){ try{ v=localStorage.getItem('autoscontri-name')||localStorage.getItem('br3_name')||''; }catch(e){} }
+    return clean(v);
+  }
+  function clean(s){ return String(s||'').replace(/[\u0000-\u001f<>]/g,'').slice(0,14)||'Giocatore'; }
+  function joinChannel(){
+    if(!chan) return;
+    members={};
+    rsub(chanT(),onRadio);
+    clearInterval(stT); stT=setInterval(announce,2000); announce();
+    render();
+  }
+  function leaveChannel(){
+    if(chan){ try{ rpub(chanT(),{t:'bye',id:myId}); }catch(e){} runsub(chanT()); }
+    clearInterval(stT); members={}; chan=''; chanOwner=null; setTalk(false); render();
+  }
+  function announce(){ if(chan) rpub(chanT(),{t:'st',id:myId,n:myName(),vo:micStream?1:0,tk:talking?1:0}); expire(); render(); }
+  function expire(){ var t=nowMs(); for(var id in members) if(t-members[id].last>7000) delete members[id]; }
+  function onRadio(o){
+    if(typeof o.id!=='string'||o.id===myId) return;
+    var m=members[o.id]||(members[o.id]={n:'Giocatore',vo:0,tk:0,last:0,heard:0,next:0});
+    m.last=nowMs();
+    if(o.t==='st'){ m.n=clean(o.n); m.vo=o.vo?1:0; m.tk=o.tk?1:0; render(); }
+    else if(o.t==='a'&&typeof o.d==='string'){ m.heard=nowMs(); m.n=o.n?clean(o.n):m.n; playChunk(m,o.d); if(!m.tkShow){ m.tkShow=1; render(); } }
+    else if(o.t==='bye'){ delete members[o.id]; render(); }
+  }
+
+  // --- audio: 8000 Hz, mu-law (come una radio/telefono), pacchetti da 200 ms ---
+  var AC=null, proc=null, srcNode=null, sinkGain=null, buf=[], pos=0, aSeq=0;
+  function ensureAC(){
+    if(!AC){ var C=window.AudioContext||window.webkitAudioContext; if(!C) return null; try{ AC=new C(); }catch(e){ return null; } }
+    if(AC.state==='suspended'&&AC.resume){ try{ AC.resume(); }catch(e){} }
+    return AC;
+  }
+  function muEnc(x){ var s=x<0?0x80:0; if(x<0) x=-x; if(x>1) x=1; var v=Math.min(32635,Math.floor(x*32767))+132, e=7; for(var m=0x4000;(v&m)===0&&e>0;m>>=1) e--; var man=(v>>(e+3))&0x0F; return ~(s|(e<<4)|man)&0xFF; }
+  var MU=new Float32Array(256);
+  (function(){ for(var i=0;i<256;i++){ var u=~i&0xFF, s=u&0x80, e=(u>>4)&7, m=u&0x0F, v=((m<<3)+132)<<e; v-=132; MU[i]=(s?-v:v)/32768; } })();
+  function b64(bytes){ var s=''; for(var i=0;i<bytes.length;i+=4096) s+=String.fromCharCode.apply(null,bytes.slice(i,i+4096)); return btoa(s); }
+  function unb64(s){ var b=atob(s), a=new Uint8Array(b.length); for(var i=0;i<b.length;i++) a[i]=b.charCodeAt(i); return a; }
+  function startCapture(stream){
+    var ac=ensureAC(); if(!ac) return false;
+    try{
+      srcNode=ac.createMediaStreamSource(stream);
+      proc=(ac.createScriptProcessor||ac.createJavaScriptNode).call(ac,4096,1,1);
+      sinkGain=ac.createGain(); sinkGain.gain.value=0;
+      srcNode.connect(proc); proc.connect(sinkGain); sinkGain.connect(ac.destination);
+    }catch(e){ return false; }
+    var ratio=ac.sampleRate/8000;
+    proc.onaudioprocess=function(ev){
+      if(!talking||!chan) { pos=0; return; }
+      var inp=ev.inputBuffer.getChannelData(0), n=inp.length;
+      while(pos<n){
+        var a=Math.floor(pos), b=Math.min(n,Math.floor(pos+ratio)), sum=0, c=0;
+        for(var i=a;i<b;i++){ sum+=inp[i]; c++; }
+        buf.push(muEnc(c?sum/c:inp[a]||0)); pos+=ratio;
+      }
+      pos-=n;
+      if(buf.length>=1600) flush();
+    };
+    return true;
+  }
+  function flush(){ if(!buf.length) return; var bytes=buf; buf=[]; rpub(chanT(),{t:'a',id:myId,n:myName(),s:++aSeq,d:b64(bytes)}); }
+  function playChunk(m,d){
+    var ac=AC; if(!ac||ac.state!=='running'){ needTap=true; ensureAC(); render(); if(!ac) return; }
+    var bytes; try{ bytes=unb64(d); }catch(e){ return; }
+    if(!bytes.length||bytes.length>8000) return;
+    var sr=ac.sampleRate, len=Math.floor(bytes.length*sr/8000), out=ac.createBuffer(1,len,sr), ch=out.getChannelData(0), k=8000/sr;
+    for(var i=0;i<len;i++){ var p=i*k, j=Math.floor(p), f=p-j, x0=MU[bytes[j]], x1=MU[bytes[Math.min(bytes.length-1,j+1)]]; ch[i]=(x0+(x1-x0)*f)*1.6; }
+    var s=ac.createBufferSource(); s.buffer=out; s.connect(ac.destination);
+    var t=ac.currentTime;
+    if(m.next<t+0.05||m.next>t+1.2) m.next=t+0.25;
+    try{ s.start(m.next); }catch(e){}
+    m.next+=out.duration;
+  }
+  function micOn(){
+    if(!navigator.mediaDevices||!navigator.mediaDevices.getUserMedia){ status='Questo browser non permette il microfono'; render(); return; }
+    ensureAC();
+    status='Consenti il microfono…'; render();
+    navigator.mediaDevices.getUserMedia({audio:{echoCancellation:true,noiseSuppression:true,autoGainControl:true},video:false}).then(function(s){
+      micStream=s; status='';
+      if(!startCapture(s)){ status='Audio non disponibile su questo browser'; }
+      announce();
+    },function(){ status='Microfono non consentito'; render(); });
+  }
+  function micOff(){
+    setTalk(false);
+    try{ if(proc){ proc.onaudioprocess=null; proc.disconnect(); } if(srcNode) srcNode.disconnect(); if(sinkGain) sinkGain.disconnect(); }catch(e){}
+    proc=null; srcNode=null; sinkGain=null;
+    if(micStream){ try{ micStream.getTracks().forEach(function(t){ t.stop(); }); }catch(e){} }
+    micStream=null; announce();
+  }
+  function setTalk(b){
+    var t=!!(b&&micStream&&chan);
+    if(t===talking) return;
+    talking=t; if(!t) flush(); else { ensureAC(); buf=[]; pos=0; }
+    announce();
+  }
+  function unlock(){
+    var ac=AC||(needTap||micStream?ensureAC():null);
+    if(!AC) ensureAC(); else if(AC.state==='suspended') ensureAC();
+    if(needTap){ needTap=false; render(); }
+  }
+  window.addEventListener('pointerdown',unlock,true);
+  window.addEventListener('touchstart',unlock,{capture:true,passive:true});
+  window.addEventListener('keydown',function(){ if(!AC||AC.state!=='running') unlock(); },true);
+  function isTyping(e){ var t=e.target; return t&&(t.tagName==='INPUT'||t.tagName==='TEXTAREA'||t.isContentEditable); }
+  window.addEventListener('keydown',function(e){ if(e.code===TALK_KEY&&!isTyping(e)&&micStream&&!e.repeat) setTalk(true); },true);
+  window.addEventListener('keyup',function(e){ if(e.code===TALK_KEY) setTalk(false); },true);
+  window.addEventListener('blur',function(){ setTalk(false); });
+
+  // ================= 4. pulsanti sullo schermo =================
+  var box=null, bRadio, bTalk, lab;
+  function el(tag){ return document.createElement(tag); }
+  function build(){
+    if(box||!document.body) return;
+    var css=el('style');
+    css.textContent='#radioSq{position:fixed;right:max(8px,env(safe-area-inset-right));top:38%;z-index:2147483000;display:none;flex-direction:column;align-items:flex-end;gap:6px;font:600 13px system-ui,-apple-system,Arial,sans-serif;-webkit-user-select:none;user-select:none;pointer-events:none}'+
+      '#radioSq button{pointer-events:auto;border:2px solid #f2d9a8;color:#fff8e8;border-radius:22px;font:700 13px system-ui,-apple-system,Arial,sans-serif;touch-action:none;-webkit-tap-highlight-color:transparent;cursor:pointer}'+
+      '#radioSq .r{background:#3b2a1acc;padding:7px 12px}#radioSq .r.on{background:#1f6b3acc}'+
+      '#radioSq .t{width:66px;height:66px;border-radius:50%;background:#8a1e1ecc;font-size:14px;line-height:1.1}#radioSq .t.on{background:#e23b2a;box-shadow:0 0 0 5px #e23b2a55}'+
+      '#radioSq .l{background:#000a;color:#ffe9b0;padding:4px 9px;border-radius:9px;max-width:190px;text-align:right;display:none}';
+    document.head.appendChild(css);
+    box=el('div'); box.id='radioSq';
+    bRadio=el('button'); bRadio.className='r';
+    bTalk=el('button'); bTalk.className='t'; bTalk.innerHTML='🎙<br>PARLA';
+    lab=el('div'); lab.className='l';
+    box.appendChild(bRadio); box.appendChild(bTalk); box.appendChild(lab);
+    document.body.appendChild(box);
+    // tocco breve = accendi/spegni; tieni premuto e trascina = sposta la radio
+    var drag=null;
+    try{ var sv=JSON.parse(localStorage.getItem('radio_pos')||'null'); if(sv&&sv.r>=0&&sv.t>=0){ box.style.right=sv.r+'px'; box.style.top=sv.t+'px'; } }catch(e){}
+    bRadio.addEventListener('pointerdown',function(e){ e.preventDefault(); e.stopPropagation(); try{ bRadio.setPointerCapture(e.pointerId); }catch(x){}
+      var r=box.getBoundingClientRect(); drag={x:e.clientX,y:e.clientY,r:window.innerWidth-r.right,t:r.top,moved:false}; });
+    bRadio.addEventListener('pointermove',function(e){ if(!drag) return; var dx=e.clientX-drag.x, dy=e.clientY-drag.y;
+      if(!drag.moved&&Math.abs(dx)+Math.abs(dy)<10) return; drag.moved=true;
+      box.style.right=Math.max(0,Math.min(window.innerWidth-60,drag.r-dx))+'px'; box.style.top=Math.max(0,Math.min(window.innerHeight-60,drag.t+dy))+'px'; });
+    var endDrag=function(e){ if(!drag) return; var d=drag; drag=null; e.preventDefault(); e.stopPropagation();
+      if(d.moved){ try{ var r=box.getBoundingClientRect(); localStorage.setItem('radio_pos',JSON.stringify({r:Math.round(window.innerWidth-r.right),t:Math.round(r.top)})); }catch(x){} return; }
+      if(e.type!=='pointerup') return;
+      unlock(); if(micStream) micOff(); else micOn(); };
+    bRadio.addEventListener('pointerup',endDrag); bRadio.addEventListener('pointercancel',endDrag);
+    bRadio.addEventListener('click',function(e){ e.preventDefault(); e.stopPropagation(); });
+    var down=function(e){ e.preventDefault(); e.stopPropagation(); try{ bTalk.setPointerCapture(e.pointerId); }catch(x){} unlock(); setTalk(true); render(); };
+    var up=function(e){ e.preventDefault(); e.stopPropagation(); setTalk(false); render(); };
+    bTalk.addEventListener('pointerdown',down); bTalk.addEventListener('pointerup',up); bTalk.addEventListener('pointercancel',up); bTalk.addEventListener('lostpointercapture',up);
+    ['click','touchstart','touchend','mousedown','mouseup'].forEach(function(t){ bTalk.addEventListener(t,function(e){ e.stopPropagation(); if(t!=='touchstart') e.preventDefault(); },{passive:false}); });
+  }
+  function render(){
+    if(!box){ if(document.body) build(); if(!box) return; }
+    var on=!!chan;
+    box.style.display=on?'flex':'none';
+    if(!on) return;
+    expire();
+    var others=0; for(var id in members) others++;
+    var up=relayUp();
+    bRadio.textContent=micStream?'📻 ON ✕':(up?'📻 Radio · '+(others+1):'📻 Radio …');
+    bRadio.className='r'+(micStream?' on':'');
+    bTalk.style.display=micStream?'block':'none';
+    bTalk.className='t'+(talking?' on':'');
+    var who=[], t=nowMs(); if(talking) who.push('tu');
+    for(var id2 in members){ var m=members[id2]; if(m.tk===1||t-m.heard<700){ who.push(m.n); } m.tkShow=0; }
+    var txt=status||(needTap?'Tocca lo schermo per sentire le voci':(who.length?'📻 '+who.join(', '):(t-relayNote<6000?'🛰 collegati tramite rete di riserva':'')));
+    lab.textContent=txt; lab.style.display=txt?'block':'none';
+  }
+  setInterval(render,500);
+  if(document.readyState==='loading') document.addEventListener('DOMContentLoaded',function(){ build(); render(); }); else { build(); render(); }
+  window.addEventListener('pagehide',function(){ try{ if(chan) rpub(chanT(),{t:'bye',id:myId}); }catch(e){} });
+  window.__radioSquadraDbg=function(){ return {chan:chan,members:members,relay:relayUp(),mic:!!micStream,talking:talking,ac:AC&&AC.state}; };
+})();
+</script>
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1"><title>Invaders 1978 — CO-OP</title><style>*{box-sizing:border-box}body{margin:0;background:#000;color:#49ff77;font:16px monospace;text-align:center}main{max-width:600px;margin:auto;padding:12px}h1{font-size:24px;letter-spacing:4px;text-shadow:0 0 12px #0f5}button,input{background:#001208;color:#49ff77;border:1px solid #49ff77;font:inherit;padding:12px;margin:4px;touch-action:none}button:hover{background:#124322}canvas{width:min(100%,48vh * 0.875);width:min(100%,55vh);max-width:448px;aspect-ratio:224/256;image-rendering:pixelated;border:1px solid #28633c;display:block;margin:auto;box-shadow:0 0 24px #123d22}#screen{position:relative}#screen:after{content:'';position:absolute;inset:0;pointer-events:none;background:repeating-linear-gradient(transparent 0 2px,#0003 2px 3px)}#touch button{min-width:75px;font-size:23px}p{line-height:1.5}#status{min-height:24px} [hidden]{display:none!important}</style><main><h1>INVADERS 1978</h1><div id="menu"><p>ARCADE VERDE FOSFORO · CO-OP</p><button id="solo">1 GIOCATORE</button><button id="local">2 SULLO STESSO PC</button><br><button id="host">CREA STANZA ONLINE</button><br><input id="code" placeholder="CODICE STANZA" maxlength="12" size="14"><button id="join">ENTRA</button><p>1P: ← → SPAZIO<br>2P locale: A D F</p></div><p id="status" role="status"></p><div id="screen"><canvas id="cv" width="224" height="256"></canvas></div><div id="touch" hidden><button data-k="left">◀</button><button data-k="fire">FIRE</button><button data-k="right">▶</button></div><button id="sound">AUDIO ON</button><button id="back" hidden>MENU</button><p>10 / 20 / 30 PUNTI · UFO BONUS</p></main><script src="https://cdn.jsdelivr.net/npm/peerjs@1.5.5/dist/peerjs.min.js" async></script><script>
+'use strict';const $=id=>document.getElementById(id),cv=$('cv'),g=cv.getContext('2d'),W=224,H=256;let state=null,mode='menu',peer=null,conn=null,role=0,keys={},remote={},sound=true,ac,last=0,sendAt=0,networkTimer=0;const green='#51ff79',sprites=[['00111100','01111110','11111111','11011011','11111111','00100100','01000010','10000001'],['00100000100','00010001000','00111111100','01101110110','11111111111','10111111101','10100000101','00011011000'],['0001111000','0111111110','1111111111','1100110011','1111111111','0011001100','0110011000','1100000011']],ship=['00000100000','00001110000','00011111000','11111111111','11111111111','11111111111'];function pix(s,x,y,flip=false){for(let i=0;i<s.length;i++)for(let j=0;j<s[i].length;j++)if(s[i][j]==='1')g.fillRect(Math.round(x)+(flip?s[i].length-1-j:j),Math.round(y)+i,1,1)}function tone(f,d=.1,end=f,type='square',vol=.035){if(!sound||!ac)return;try{let o=ac.createOscillator(),a=ac.createGain();o.type=type;o.frequency.setValueAtTime(f,ac.currentTime);o.frequency.exponentialRampToValueAtTime(Math.max(20,end),ac.currentTime+d);a.gain.setValueAtTime(vol,ac.currentTime);a.gain.exponentialRampToValueAtTime(.001,ac.currentTime+d);o.connect(a);a.connect(ac.destination);o.start();o.stop(ac.currentTime+d)}catch(e){}}function audio(){try{ac=ac||new (window.AudioContext||window.webkitAudioContext)();ac.resume()}catch(e){}}function fx(t){if(t==='fire')tone(650,.11,100);if(t==='hit')tone(125,.11,50);if(t==='dead')tone(95,.45,25,'sawtooth');if(t==='ufo')tone(950,.22,300);if(t==='step')tone([90,82,75,68][state?.beat%4||0],.09,55);if(t==='wave')tone(240,.4,780);if(mode==='host'&&conn?.open)conn.send({t:'fx',v:t})}function high(){try{return +localStorage.getItem('invadersHigh')||0}catch(e){return 0}}function save(){try{localStorage.setItem('invadersHigh',Math.max(high(),state.score))}catch(e){}}function wave(){let s=state;s.aliens=[];s.dx=1;s.move=0;s.enemy=0;s.beat=0;s.shots=[];s.ufo=null;s.ufoTime=18;s.pause=1.4;s.shields=[];for(let r=0;r<5;r++)for(let c=0;c<11;c++)s.aliens.push({x:23+c*16,y:38+Math.min(48,(s.level-1)*8)+r*13,r,c});for(let k=0;k<4;k++)for(let y=0;y<14;y++)for(let x=0;x<24;x++)if((y>2||x>=3&&x<21)&&!(y>8&&x>=8&&x<16))s.shields.push([19+k*54+x,y+199]);}function start(n,m){mode=m;state={level:1,score:0,players:Array.from({length:n},(_,i)=>({x:n===1?112:70+i*84,lives:3,score:0,bonus:false,inv:1,dead:0,shots:0})),over:false};wave();$('menu').hidden=true;$('touch').hidden=false;$('back').hidden=false;$('status').textContent=n===2?'CO-OP · DIFENDETE LA TERRA':'1 PLAYER';audio()}function points(p,n){p.score+=n;state.score+=n;if(!p.bonus&&p.score>=1500){p.bonus=true;p.lives++;fx('wave')}save()}function hitPlayer(p){if(p.inv>0||p.dead>0||p.lives<=0)return;p.lives--;p.dead=1.4;p.inv=3;fx('dead');if(state.players.every(q=>q.lives<=0)){state.over=true;save()}}function input(i){if(i===1&&mode==='host')return remote;if(i===1)return{left:keys.KeyA,right:keys.KeyD,fire:keys.KeyF};return{left:keys.ArrowLeft||keys.touchLeft,right:keys.ArrowRight||keys.touchRight,fire:keys.Space||keys.touchFire}}function tick(dt){let s=state;if(!s||s.over)return;if(s.pause>0){s.pause-=dt;return}for(let [i,p] of s.players.entries()){p.inv=Math.max(0,p.inv-dt);p.dead=Math.max(0,p.dead-dt);if(!p.lives||p.dead)continue;let k=input(i);p.x=Math.max(7,Math.min(217,p.x+((k.right?1:0)-(k.left?1:0))*78*dt));if(k.fire&&!s.shots.some(b=>b.owner===i)){p.shots++;s.shots.push({x:p.x,y:232,v:-145,owner:i});fx('fire')}}let count=s.aliens.length;s.move+=dt;let interval=Math.max(.045,.66*(count/55)**.87/(1+(s.level-1)*.07));if(s.move>=interval){s.move-=interval;let edge=s.aliens.some(a=>a.x+s.dx*3<5||a.x+s.dx*3>208);if(edge){s.dx*=-1;for(let a of s.aliens)a.y+=8}else for(let a of s.aliens)a.x+=s.dx*3;s.beat++;fx('step');if(s.aliens.some(a=>a.y+8>=233)){s.over=true;save();fx('dead');return}s.shields=s.shields.filter(([x,y])=>!s.aliens.some(a=>x>=a.x&&x<a.x+11&&y>=a.y&&y<a.y+8))}s.enemy-=dt;if(s.enemy<=0){s.enemy=Math.max(.28,1.2-s.level*.055)*(.65+Math.random()*.7);let bottom=s.aliens.filter(a=>!s.aliens.some(b=>b.c===a.c&&b.r>a.r));if(bottom.length&&s.shots.filter(b=>b.owner===-1).length<3){let a=bottom[Math.floor(Math.random()*bottom.length)];s.shots.push({x:a.x+5,y:a.y+9,v:58+Math.min(60,s.level*5),owner:-1})}}s.ufoTime-=dt;if(!s.ufo&&s.ufoTime<=0){s.ufo={x:-18};s.ufoTime=22+Math.random()*8}if(s.ufo){s.ufo.x+=36*dt;if(s.ufo.x>230)s.ufo=null}for(let b of s.shots){b.y+=b.v*dt;if(b.y<17||b.y>249){b.gone=true;continue}let j=s.shields.findIndex(q=>Math.abs(q[0]-b.x)<2&&Math.abs(q[1]-b.y)<3);if(j>=0){let [x,y]=s.shields[j];s.shields=s.shields.filter(q=>Math.abs(q[0]-x)>3||Math.abs(q[1]-y)>3);b.gone=true;continue}if(b.owner>=0){let a=s.aliens.find(a=>b.x>=a.x-1&&b.x<=a.x+11&&b.y>=a.y-2&&b.y<=a.y+9);if(a){s.aliens.splice(s.aliens.indexOf(a),1);points(s.players[b.owner],a.r===0?30:a.r<3?20:10);b.gone=true;fx('hit')}else if(s.ufo&&b.y<30&&b.y>18&&Math.abs(b.x-s.ufo.x-8)<10){let p=s.players[b.owner];points(p,[50,100,150,300][(p.shots%15===0)?3:p.shots%3]);s.ufo=null;b.gone=true;fx('ufo')}}else{let p=s.players.find(p=>p.lives>0&&!p.dead&&p.inv<=0&&Math.abs(p.x-b.x)<7&&b.y>=232&&b.y<=241);if(p){hitPlayer(p);b.gone=true}}}s.shots=s.shots.filter(b=>!b.gone);if(!s.aliens.length&&!s.over){s.level++;wave();fx('wave')}}function txt(t,x,y,size=8){g.font=size+'px monospace';g.fillText(t,x,y)}function draw(){g.fillStyle='#000';g.fillRect(0,0,W,H);g.fillStyle=green;if(!state){txt('HIGH SCORE '+String(high()).padStart(4,'0'),65,15);for(let r=0;r<3;r++){pix(sprites[r],65,82+r*25);txt(['30 POINTS','20 POINTS','10 POINTS'][r],88,89+r*25)}txt('INSERT PLAYER',76,180);return}let s=state;txt('SCORE '+String(s.score).padStart(4,'0'),5,11);txt('HI '+String(Math.max(high(),s.score)).padStart(4,'0'),85,11);txt('WAVE '+s.level,174,11);for(let a of s.aliens)pix(sprites[a.r===0?0:a.r<3?1:2],a.x,a.y,s.beat%2===1);if(s.ufo)pix(['00001111110000','00111111111100','11111111111111','11011011011011','01111111111110','00110000110000'],s.ufo.x,22);for(let q of s.shields)g.fillRect(q[0],q[1],1,1);for(let b of s.shots)g.fillRect(Math.round(b.x),Math.round(b.y),1,b.owner<0?4:3);for(let [i,p] of s.players.entries()){if(p.lives&&!p.dead&&(p.inv<=0||Math.floor(p.inv*10)%2===0)){pix(ship,p.x-5,233);if(s.players.length>1)txt(String(i+1),p.x-2,247,6)}}g.fillRect(4,250,216,1);txt('1P '+s.players[0].lives,5,255,6);if(s.players[1])txt('2P '+s.players[1].lives,190,255,6);if(s.over||s.pause>0){g.fillStyle='#000';g.fillRect(30,111,164,29);g.fillStyle=green;txt(s.over?'GAME OVER':'WAVE '+s.level,s.over?74:85,128,13);if(s.over)txt('MENU PER RIPROVARE',64,138,7)}}function loop(t){let dt=Math.min(.045,(t-last)/1000||0);last=t;if(mode==='solo'||mode==='local'||mode==='host')tick(dt);if(t-sendAt>50){sendAt=t;if(conn?.open){if(mode==='host'&&state)conn.send({t:'state',v:state});if(mode==='guest')conn.send({t:'input',v:input(0)})}}draw();requestAnimationFrame(loop)}requestAnimationFrame(loop);function reset(){clearTimeout(networkTimer);mode='menu';state=null;keys={};remote={};let old=peer;peer=null;conn=null;try{old?.destroy()}catch(e){}$('menu').hidden=false;$('touch').hidden=true;$('back').hidden=true;$('status').textContent=''}function fail(msg){if(mode==='menu')return;reset();$('status').textContent=msg}function connect(c,host){conn=c;c.on('open',()=>{if(conn!==c)return;clearTimeout(networkTimer);if(host){start(2,'host');c.send({t:'start'})}else{$('status').textContent='CONNESSO · ATTENDI'}});c.on('data',d=>{if(conn!==c||!d)return;if(host&&d.t==='input')remote=d.v||{};if(!host&&d.t==='start'){mode='guest';$('menu').hidden=true;$('touch').hidden=false;$('back').hidden=false;$('status').textContent='CO-OP ONLINE · 2P'}if(!host&&d.t==='state')state=d.v;if(!host&&d.t==='fx')fx(d.v)});c.on('close',()=>{if(conn===c)fail('CONNESSIONE CHIUSA')});c.on('error',()=>{if(conn===c)fail('ERRORE CONNESSIONE')})}function online(host){audio();if(!window.Peer){$('status').textContent='SERVIZIO ONLINE NON DISPONIBILE. RIPROVA O GIOCA IN LOCALE.';return}let code=host?Math.random().toString(36).slice(2,8).toUpperCase():$('code').value.trim().toUpperCase();if(!/^[A-Z0-9]{6}$/.test(code)){$('status').textContent='INSERISCI 6 CARATTERI';return}mode='waiting';$('menu').hidden=true;$('back').hidden=false;$('status').textContent='CONNESSIONE...';try{let p=host?new Peer('invaders78-'+code):new Peer();peer=p;networkTimer=setTimeout(()=>{if(peer===p&&mode==='waiting'&&!host)fail('STANZA NON RAGGIUNGIBILE')},20000);p.on('open',()=>{if(peer!==p)return;if(host){$('status').textContent='CODICE '+code+' · ATTENDO 2P'}else connect(p.connect('invaders78-'+code,{reliable:true}),false)});p.on('connection',c=>{if(peer!==p||!host||conn){c.close();return}connect(c,true)});p.on('error',e=>{if(peer===p)fail('ERRORE ONLINE: '+e.type)})}catch(e){fail('ERRORE ONLINE')}}$('solo').onclick=()=>start(1,'solo');$('local').onclick=()=>start(2,'local');$('host').onclick=()=>online(true);$('join').onclick=()=>online(false);$('back').onclick=reset;$('sound').onclick=()=>{sound=!sound;audio();$('sound').textContent='AUDIO '+(sound?'ON':'OFF')};addEventListener('keydown',e=>{if(mode!=='menu'&&['ArrowLeft','ArrowRight','Space','KeyA','KeyD','KeyF'].includes(e.code)){e.preventDefault();keys[e.code]=true;audio()}});addEventListener('keyup',e=>{keys[e.code]=false});addEventListener('blur',()=>keys={});document.querySelectorAll('[data-k]').forEach(b=>{let k='touch'+b.dataset.k[0].toUpperCase()+b.dataset.k.slice(1);b.onpointerdown=e=>{e.preventDefault();audio();b.setPointerCapture(e.pointerId);keys[k]=true};b.onpointerup=b.onpointercancel=b.onlostpointercapture=()=>keys[k]=false});
+</script></html>

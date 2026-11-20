@@ -1,0 +1,889 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+<meta charset="utf-8">
+<script>
+/* RETE DI RISERVA + RADIO DI SQUADRA — modulo comune ai giochi online di balbalu-bot.
+   1) Se il collegamento diretto tra due dispositivi non parte (tipico: telefono con i dati
+      mobili), la partita passa da sola su un server pubblico (MQTT) che fa da ponte.
+   2) Radio "premi e parla": la voce viaggia sullo stesso server, quindi funziona da qualsiasi rete.
+   Il gioco non viene modificato: il modulo si aggancia a PeerJS e, se qualcosa va storto, si spegne. */
+(function(){
+  'use strict';
+  if(window.__radioSquadra) return; window.__radioSquadra=1;
+
+  var BROKERS=window.__RADIO_TEST_BROKERS||['wss://broker.emqx.io:8084/mqtt','wss://broker.hivemq.com:8884/mqtt'];
+  var MQTT_URL=window.__RADIO_TEST_MQTT||'https://unpkg.com/mqtt@5.16.1/dist/mqtt.min.js';
+  var PFX='balbalu/rr1/', TALK_KEY='KeyN', FALLBACK_MS=7000;
+  function rid(){ return Math.random().toString(36).slice(2,10); }
+  function tclean(s){ return String(s||'').replace(/[^A-Za-z0-9_.-]/g,'_').slice(0,80); }
+  function nowMs(){ return Date.now(); }
+
+  // ================= 1. server ponte (MQTT) =================
+  var R={clients:[],subs:{},loading:false,seen:{},seenQ:[],seq:0,id:rid()+rid()};
+  function relayStart(){
+    if(R.clients.length||R.loading) return;
+    if(window.mqtt&&window.mqtt.connect){ connectAll(); return; }
+    R.loading=true;
+    var s=document.createElement('script'); s.src=MQTT_URL;
+    s.onload=function(){ R.loading=false; if(window.mqtt&&window.mqtt.connect) connectAll(); };
+    s.onerror=function(){ R.loading=false; };
+    (document.head||document.documentElement).appendChild(s);
+  }
+  function connectAll(){
+    BROKERS.forEach(function(u){
+      var c; try{ c=window.mqtt.connect(u,{clientId:'bb'+rid()+rid(),keepalive:30,reconnectPeriod:4000,connectTimeout:10000,clean:true}); }catch(e){ return; }
+      c.on('connect',function(){ Object.keys(R.subs).forEach(function(t){ try{ c.subscribe(t,{qos:0}); }catch(e){} }); render(); });
+      c.on('message',function(t,p){ onRelayMsg(t,p); });
+      c.on('error',function(){}); c.on('close',function(){ render(); });
+      R.clients.push(c);
+    });
+  }
+  function relayUp(){ for(var i=0;i<R.clients.length;i++) if(R.clients[i].connected) return true; return false; }
+  function rsub(t,fn){ t=PFX+t; R.subs[t]=fn; relayStart(); R.clients.forEach(function(c){ if(c.connected) try{ c.subscribe(t,{qos:0}); }catch(e){} }); }
+  function runsub(t){ t=PFX+t; delete R.subs[t]; R.clients.forEach(function(c){ try{ c.unsubscribe(t); }catch(e){} }); }
+  function rpub(t,o){
+    relayStart(); o._m=R.id+':'+(++R.seq);
+    var s; try{ s=JSON.stringify(o); }catch(e){ return; }
+    R.clients.forEach(function(c){ if(c.connected) try{ c.publish(PFX+t,s,{qos:0}); }catch(e){} });
+  }
+  var TD=(typeof TextDecoder!=='undefined')?new TextDecoder():null;
+  function onRelayMsg(t,p){
+    var fn=R.subs[t]; if(!fn) return;
+    var o; try{ o=JSON.parse(typeof p==='string'?p:(TD?TD.decode(p):String(p))); }catch(e){ return; }
+    if(!o||typeof o!=='object') return;
+    var m=o._m;
+    if(typeof m==='string'){ if(R.seen[m]) return; R.seen[m]=1; R.seenQ.push(m); if(R.seenQ.length>4000) delete R.seen[R.seenQ.shift()]; }
+    try{ fn(o); }catch(e){ setTimeout(function(){ throw e; }); }
+  }
+
+  // piccolo gestore di eventi, compatibile con quello di PeerJS
+  function Em(){ this._ev={}; }
+  Em.prototype.on=function(e,f){ (this._ev[e]=this._ev[e]||[]).push(f); return this; };
+  Em.prototype.addListener=Em.prototype.on;
+  Em.prototype.once=function(e,f){ var me=this; function g(){ me.off(e,g); return f.apply(me,arguments); } g._f=f; return this.on(e,g); };
+  Em.prototype.off=function(e,f){ var a=this._ev[e]; if(!a) return this; if(!f){ delete this._ev[e]; return this; } this._ev[e]=a.filter(function(x){ return x!==f&&x._f!==f; }); return this; };
+  Em.prototype.removeListener=Em.prototype.off;
+  Em.prototype.removeAllListeners=function(e){ if(e) delete this._ev[e]; else this._ev={}; return this; };
+  Em.prototype.listenerCount=function(e){ return (this._ev[e]||[]).length; };
+  Em.prototype.listeners=function(e){ return (this._ev[e]||[]).slice(); };
+  Em.prototype.emit=function(e){
+    var a=(this._ev[e]||[]).slice(), args=[].slice.call(arguments,1), me=this;
+    a.forEach(function(f){ try{ f.apply(me,args); }catch(x){ setTimeout(function(){ throw x; }); } });
+    return a.length>0;
+  };
+
+  var relayNote=0;
+  function noteRelay(){ relayNote=nowMs(); render(); setTimeout(render,6000); }
+
+  // --- lato di chi entra: collegamento "doppio" (diretto, altrimenti ponte) ---
+  function XConn(provider,target,opts){
+    Em.call(this); opts=opts||{};
+    this.peer=target; this.provider=provider; this.open=false; this.type='data';
+    this.label=opts.label||('dc_'+rid()); this.metadata=opts.metadata; this.serialization=opts.serialization||'binary'; this.reliable=!!opts.reliable;
+    this.mode='real'; this.real=null; this.closed=false; this.noRelay=false; this.__radioProxy=true;
+  }
+  XConn.prototype=Object.create(Em.prototype);
+  XConn.prototype.attach=function(real){
+    var me=this; me.real=real;
+    real.on('open',function(){ if(me.mode!=='real'||me.closed) return; clearTimeout(me.fbT); me.open=true; me.emit('open'); });
+    real.on('data',function(d){ if(me.mode==='real'&&!me.closed) me.emit('data',d); });
+    real.on('close',function(){ if(me.mode!=='real'||me.closed) return; if(me.open||me.noRelay) me._end(); else me.toRelay(); });
+    real.on('error',function(e){ if(me.mode!=='real'||me.closed) return; if(me.open) me.emit('error',e); else if(!me.noRelay) me.toRelay(); });
+    me.fbT=setTimeout(function(){ if(!me.open&&me.mode==='real'&&!me.closed&&!me.noRelay) me.toRelay(); },FALLBACK_MS);
+  };
+  XConn.prototype.toRelay=function(){
+    var me=this; if(me.mode==='relay'||me.closed||me.noRelay) return;
+    me.mode='relay'; clearTimeout(me.fbT);
+    try{ if(me.real) me.real.close(); }catch(e){}
+    me.gid=tclean(me.provider.id||('g'+rid())); me.cid=rid(); me.hostT='h/'+tclean(me.peer); me.inT='g/'+me.gid+'/'+me.cid;
+    rsub(me.inT,function(o){ me._msg(o); });
+    var tries=0;
+    (function hello(){
+      if(me.open||me.closed) return;
+      if(++tries>24){ me.emit('error',{type:'peer-unavailable',message:'Collegamento non riuscito'}); me._end(); return; }
+      rpub(me.hostT,{t:'hello',from:me.gid,cid:me.cid});
+      me.helloT=setTimeout(hello,1500);
+    })();
+  };
+  XConn.prototype._msg=function(o){
+    var me=this; if(me.closed) return; me.last=nowMs();
+    if(o.t==='ack'&&!me.open){
+      me.open=true; clearTimeout(me.helloT); noteRelay(); me.emit('open');
+      me.pingT=setInterval(function(){ if(nowMs()-me.last>16000){ me._end(); return; } rpub(me.hostT,{t:'p',from:me.gid,cid:me.cid}); },4000);
+    } else if(o.t==='d'&&me.open) me.emit('data',o.d);
+    else if(o.t==='bye') me._end();
+  };
+  XConn.prototype.send=function(d){
+    if(this.closed) return;
+    if(this.mode==='real'){ if(this.real) return this.real.send(d); }
+    else if(this.open) rpub(this.hostT,{t:'d',from:this.gid,cid:this.cid,d:d});
+  };
+  XConn.prototype.close=function(){
+    if(this.closed) return;
+    if(this.mode==='real'){ try{ if(this.real) this.real.close(); }catch(e){} }
+    else rpub(this.hostT,{t:'bye',from:this.gid,cid:this.cid});
+    this._end();
+  };
+  XConn.prototype._end=function(){
+    if(this.closed) return; this.closed=true; this.open=false;
+    clearTimeout(this.fbT); clearTimeout(this.helloT); clearInterval(this.pingT);
+    if(this.inT) runsub(this.inT);
+    this.emit('close');
+  };
+  Object.defineProperty(XConn.prototype,'dataChannel',{get:function(){ return this.real&&this.mode==='real'?this.real.dataChannel:null; }});
+  Object.defineProperty(XConn.prototype,'peerConnection',{get:function(){ return this.real&&this.mode==='real'?this.real.peerConnection:null; }});
+
+  // --- lato di chi crea la stanza: accetta anche chi arriva dal ponte ---
+  function HConn(host,from,cid){
+    Em.call(this); this.peer=from; this.cid=cid; this.provider=host; this.open=false; this.closed=false; this.type='data';
+    this.label='relay_'+cid; this.serialization='json'; this.reliable=true; this.__relayH=true; this.outT='g/'+tclean(from)+'/'+cid; this.last=nowMs();
+    var me=this;
+    this.pingT=setInterval(function(){ if(nowMs()-me.last>16000){ me._end(); return; } rpub(me.outT,{t:'p'}); },4000);
+  }
+  HConn.prototype=Object.create(Em.prototype);
+  HConn.prototype.send=function(d){ if(this.open&&!this.closed) rpub(this.outT,{t:'d',d:d}); };
+  HConn.prototype.close=function(){ if(this.closed) return; rpub(this.outT,{t:'bye'}); this._end(); };
+  HConn.prototype._end=function(){
+    if(this.closed) return; this.closed=true; this.open=false; clearInterval(this.pingT);
+    var rh=this.provider.__rh; if(rh&&rh.conns[this.cid]===this) delete rh.conns[this.cid];
+    this.emit('close');
+  };
+  function relayHost(p,superEmit){
+    if(p.__rh||!p.id) return;
+    var rh=p.__rh={conns:{},topic:'h/'+tclean(p.id)};
+    rsub(rh.topic,function(o){
+      if(p.destroyed||typeof o.cid!=='string'||typeof o.from!=='string') return;
+      var c=rh.conns[o.cid];
+      if(o.t==='hello'){
+        if(!c){
+          c=new HConn(p,o.from,o.cid); rh.conns[o.cid]=c;
+          superEmit('connection',c);
+          setTimeout(function(){ if(!c.closed){ c.open=true; noteRelay(); c.emit('open'); } },0);
+        }
+        rpub(c.outT,{t:'ack'});
+      } else if(c){
+        c.last=nowMs();
+        if(o.t==='d'&&c.open) c.emit('data',o.d);
+        else if(o.t==='bye') c._end();
+      }
+    });
+  }
+  function relayHostStop(p){
+    var rh=p.__rh; if(!rh) return; p.__rh=null; runsub(rh.topic);
+    for(var k in rh.conns){ try{ rh.conns[k].close(); }catch(e){} }
+  }
+
+  // ================= 2. aggancio a PeerJS =================
+  var chan='', chanOwner=null;
+  function noteChannel(id,owner){
+    if(typeof id!=='string'||!id) return;
+    if(chan===id){ chanOwner=owner||chanOwner; return; }
+    leaveChannel(); chan=id; chanOwner=owner||null; joinChannel();
+  }
+  function wrap(P){
+    if(typeof P!=='function'||P.__radioWrapped) return P;
+    var W;
+    try{
+      W=class extends P{
+        constructor(){
+          super(...arguments);
+          var me=this, fixed=(typeof arguments[0]==='string')?arguments[0]:null;
+          me.__proxies=[];
+          try{
+            if(fixed) me.on('open',function(){ relayHost(me,function(ev,a){ return P.prototype.emit.call(me,ev,a); }); if(!me.__radioGuest) noteChannel(fixed,me); });
+            me.on('connection',function(){ if(!me.__radioGuest&&me.id) noteChannel(me.id,me); });
+          }catch(e){}
+        }
+        connect(id,opts){
+          this.__radioGuest=true;
+          try{ noteChannel(id,this); }catch(e){}
+          var real=super.connect.apply(this,arguments);
+          if(!real||typeof real.on!=='function') return real;
+          var x=new XConn(this,id,opts); x.attach(real); this.__proxies.push(x);
+          return x;
+        }
+        emit(ev,a){
+          // chi crea la stanza vede un collegamento diretto solo quando è davvero aperto:
+          // se non si apre, il gioco non lo vede e l'altro arriva dal ponte
+          if(ev==='connection'&&a&&!a.__relayH&&!a.open&&typeof a.on==='function'){
+            var done=false;
+            a.on('open',()=>{ if(done) return; done=true; super.emit('connection',a); setTimeout(function(){ try{ a.emit('open'); }catch(e){} },0); });
+            return true;
+          }
+          if(ev==='error'&&a&&a.type==='peer-unavailable'&&this.__proxies){
+            this.__proxies.forEach(function(x){ if(!x.open){ x.noRelay=true; clearTimeout(x.fbT); } });
+          }
+          return super.emit.apply(this,arguments);
+        }
+        destroy(){
+          try{ relayHostStop(this); }catch(e){}
+          try{ (this.__proxies||[]).forEach(function(x){ x.close(); }); }catch(e){}
+          try{ if(chanOwner===this) setTimeout(function(){ if(chanOwner&&chanOwner.destroyed) leaveChannel(); },0); }catch(e){}
+          return super.destroy.apply(this,arguments);
+        }
+      };
+      W.__radioWrapped=true;
+    }catch(e){ return P; }
+    return W;
+  }
+  try{
+    var cur=window.Peer;
+    if(cur) cur=wrap(cur);
+    Object.defineProperty(window,'Peer',{configurable:true,enumerable:true,
+      get:function(){ return cur; },
+      set:function(v){ if(window.__RADIO_TEST_PEER) v=window.__RADIO_TEST_PEER; cur=wrap(v); }});
+  }catch(e){}
+
+  // ================= 3. radio: presenze e voce sul ponte =================
+  var myId=rid()+rid(), members={}, micStream=null, talking=false, status='', needTap=false, stT=null;
+  function chanT(){ return 'r/'+tclean(chan); }
+  var lastName='';
+  document.addEventListener('input',function(e){ var t=e.target; if(t&&t.matches&&t.matches('#nickname,#name,#nome,#nick,#playerName,#nm,#cs')) lastName=String(t.value||''); },true);
+  function myName(){
+    var el=document.querySelector('#nickname,#name,#nome,#nick,#playerName,#nm,#cs');
+    var v=el&&el.value?String(el.value).trim():(lastName||'').trim();
+    if(!v){ try{ v=localStorage.getItem('autoscontri-name')||localStorage.getItem('br3_name')||''; }catch(e){} }
+    return clean(v);
+  }
+  function clean(s){ return String(s||'').replace(/[\u0000-\u001f<>]/g,'').slice(0,14)||'Giocatore'; }
+  function joinChannel(){
+    if(!chan) return;
+    members={};
+    rsub(chanT(),onRadio);
+    clearInterval(stT); stT=setInterval(announce,2000); announce();
+    render();
+  }
+  function leaveChannel(){
+    if(chan){ try{ rpub(chanT(),{t:'bye',id:myId}); }catch(e){} runsub(chanT()); }
+    clearInterval(stT); members={}; chan=''; chanOwner=null; setTalk(false); render();
+  }
+  function announce(){ if(chan) rpub(chanT(),{t:'st',id:myId,n:myName(),vo:micStream?1:0,tk:talking?1:0}); expire(); render(); }
+  function expire(){ var t=nowMs(); for(var id in members) if(t-members[id].last>7000) delete members[id]; }
+  function onRadio(o){
+    if(typeof o.id!=='string'||o.id===myId) return;
+    var m=members[o.id]||(members[o.id]={n:'Giocatore',vo:0,tk:0,last:0,heard:0,next:0});
+    m.last=nowMs();
+    if(o.t==='st'){ m.n=clean(o.n); m.vo=o.vo?1:0; m.tk=o.tk?1:0; render(); }
+    else if(o.t==='a'&&typeof o.d==='string'){ m.heard=nowMs(); m.n=o.n?clean(o.n):m.n; playChunk(m,o.d); if(!m.tkShow){ m.tkShow=1; render(); } }
+    else if(o.t==='bye'){ delete members[o.id]; render(); }
+  }
+
+  // --- audio: 8000 Hz, mu-law (come una radio/telefono), pacchetti da 200 ms ---
+  var AC=null, proc=null, srcNode=null, sinkGain=null, buf=[], pos=0, aSeq=0;
+  function ensureAC(){
+    if(!AC){ var C=window.AudioContext||window.webkitAudioContext; if(!C) return null; try{ AC=new C(); }catch(e){ return null; } }
+    if(AC.state==='suspended'&&AC.resume){ try{ AC.resume(); }catch(e){} }
+    return AC;
+  }
+  function muEnc(x){ var s=x<0?0x80:0; if(x<0) x=-x; if(x>1) x=1; var v=Math.min(32635,Math.floor(x*32767))+132, e=7; for(var m=0x4000;(v&m)===0&&e>0;m>>=1) e--; var man=(v>>(e+3))&0x0F; return ~(s|(e<<4)|man)&0xFF; }
+  var MU=new Float32Array(256);
+  (function(){ for(var i=0;i<256;i++){ var u=~i&0xFF, s=u&0x80, e=(u>>4)&7, m=u&0x0F, v=((m<<3)+132)<<e; v-=132; MU[i]=(s?-v:v)/32768; } })();
+  function b64(bytes){ var s=''; for(var i=0;i<bytes.length;i+=4096) s+=String.fromCharCode.apply(null,bytes.slice(i,i+4096)); return btoa(s); }
+  function unb64(s){ var b=atob(s), a=new Uint8Array(b.length); for(var i=0;i<b.length;i++) a[i]=b.charCodeAt(i); return a; }
+  function startCapture(stream){
+    var ac=ensureAC(); if(!ac) return false;
+    try{
+      srcNode=ac.createMediaStreamSource(stream);
+      proc=(ac.createScriptProcessor||ac.createJavaScriptNode).call(ac,4096,1,1);
+      sinkGain=ac.createGain(); sinkGain.gain.value=0;
+      srcNode.connect(proc); proc.connect(sinkGain); sinkGain.connect(ac.destination);
+    }catch(e){ return false; }
+    var ratio=ac.sampleRate/8000;
+    proc.onaudioprocess=function(ev){
+      if(!talking||!chan) { pos=0; return; }
+      var inp=ev.inputBuffer.getChannelData(0), n=inp.length;
+      while(pos<n){
+        var a=Math.floor(pos), b=Math.min(n,Math.floor(pos+ratio)), sum=0, c=0;
+        for(var i=a;i<b;i++){ sum+=inp[i]; c++; }
+        buf.push(muEnc(c?sum/c:inp[a]||0)); pos+=ratio;
+      }
+      pos-=n;
+      if(buf.length>=1600) flush();
+    };
+    return true;
+  }
+  function flush(){ if(!buf.length) return; var bytes=buf; buf=[]; rpub(chanT(),{t:'a',id:myId,n:myName(),s:++aSeq,d:b64(bytes)}); }
+  function playChunk(m,d){
+    var ac=AC; if(!ac||ac.state!=='running'){ needTap=true; ensureAC(); render(); if(!ac) return; }
+    var bytes; try{ bytes=unb64(d); }catch(e){ return; }
+    if(!bytes.length||bytes.length>8000) return;
+    var sr=ac.sampleRate, len=Math.floor(bytes.length*sr/8000), out=ac.createBuffer(1,len,sr), ch=out.getChannelData(0), k=8000/sr;
+    for(var i=0;i<len;i++){ var p=i*k, j=Math.floor(p), f=p-j, x0=MU[bytes[j]], x1=MU[bytes[Math.min(bytes.length-1,j+1)]]; ch[i]=(x0+(x1-x0)*f)*1.6; }
+    var s=ac.createBufferSource(); s.buffer=out; s.connect(ac.destination);
+    var t=ac.currentTime;
+    if(m.next<t+0.05||m.next>t+1.2) m.next=t+0.25;
+    try{ s.start(m.next); }catch(e){}
+    m.next+=out.duration;
+  }
+  function micOn(){
+    if(!navigator.mediaDevices||!navigator.mediaDevices.getUserMedia){ status='Questo browser non permette il microfono'; render(); return; }
+    ensureAC();
+    status='Consenti il microfono…'; render();
+    navigator.mediaDevices.getUserMedia({audio:{echoCancellation:true,noiseSuppression:true,autoGainControl:true},video:false}).then(function(s){
+      micStream=s; status='';
+      if(!startCapture(s)){ status='Audio non disponibile su questo browser'; }
+      announce();
+    },function(){ status='Microfono non consentito'; render(); });
+  }
+  function micOff(){
+    setTalk(false);
+    try{ if(proc){ proc.onaudioprocess=null; proc.disconnect(); } if(srcNode) srcNode.disconnect(); if(sinkGain) sinkGain.disconnect(); }catch(e){}
+    proc=null; srcNode=null; sinkGain=null;
+    if(micStream){ try{ micStream.getTracks().forEach(function(t){ t.stop(); }); }catch(e){} }
+    micStream=null; announce();
+  }
+  function setTalk(b){
+    var t=!!(b&&micStream&&chan);
+    if(t===talking) return;
+    talking=t; if(!t) flush(); else { ensureAC(); buf=[]; pos=0; }
+    announce();
+  }
+  function unlock(){
+    var ac=AC||(needTap||micStream?ensureAC():null);
+    if(!AC) ensureAC(); else if(AC.state==='suspended') ensureAC();
+    if(needTap){ needTap=false; render(); }
+  }
+  window.addEventListener('pointerdown',unlock,true);
+  window.addEventListener('touchstart',unlock,{capture:true,passive:true});
+  window.addEventListener('keydown',function(){ if(!AC||AC.state!=='running') unlock(); },true);
+  function isTyping(e){ var t=e.target; return t&&(t.tagName==='INPUT'||t.tagName==='TEXTAREA'||t.isContentEditable); }
+  window.addEventListener('keydown',function(e){ if(e.code===TALK_KEY&&!isTyping(e)&&micStream&&!e.repeat) setTalk(true); },true);
+  window.addEventListener('keyup',function(e){ if(e.code===TALK_KEY) setTalk(false); },true);
+  window.addEventListener('blur',function(){ setTalk(false); });
+
+  // ================= 4. pulsanti sullo schermo =================
+  var box=null, bRadio, bTalk, lab;
+  function el(tag){ return document.createElement(tag); }
+  function build(){
+    if(box||!document.body) return;
+    var css=el('style');
+    css.textContent='#radioSq{position:fixed;right:max(8px,env(safe-area-inset-right));top:38%;z-index:2147483000;display:none;flex-direction:column;align-items:flex-end;gap:6px;font:600 13px system-ui,-apple-system,Arial,sans-serif;-webkit-user-select:none;user-select:none;pointer-events:none}'+
+      '#radioSq button{pointer-events:auto;border:2px solid #f2d9a8;color:#fff8e8;border-radius:22px;font:700 13px system-ui,-apple-system,Arial,sans-serif;touch-action:none;-webkit-tap-highlight-color:transparent;cursor:pointer}'+
+      '#radioSq .r{background:#3b2a1acc;padding:7px 12px}#radioSq .r.on{background:#1f6b3acc}'+
+      '#radioSq .t{width:66px;height:66px;border-radius:50%;background:#8a1e1ecc;font-size:14px;line-height:1.1}#radioSq .t.on{background:#e23b2a;box-shadow:0 0 0 5px #e23b2a55}'+
+      '#radioSq .l{background:#000a;color:#ffe9b0;padding:4px 9px;border-radius:9px;max-width:190px;text-align:right;display:none}';
+    document.head.appendChild(css);
+    box=el('div'); box.id='radioSq';
+    bRadio=el('button'); bRadio.className='r';
+    bTalk=el('button'); bTalk.className='t'; bTalk.innerHTML='🎙<br>PARLA';
+    lab=el('div'); lab.className='l';
+    box.appendChild(bRadio); box.appendChild(bTalk); box.appendChild(lab);
+    document.body.appendChild(box);
+    // tocco breve = accendi/spegni; tieni premuto e trascina = sposta la radio
+    var drag=null;
+    try{ var sv=JSON.parse(localStorage.getItem('radio_pos')||'null'); if(sv&&sv.r>=0&&sv.t>=0){ box.style.right=sv.r+'px'; box.style.top=sv.t+'px'; } }catch(e){}
+    bRadio.addEventListener('pointerdown',function(e){ e.preventDefault(); e.stopPropagation(); try{ bRadio.setPointerCapture(e.pointerId); }catch(x){}
+      var r=box.getBoundingClientRect(); drag={x:e.clientX,y:e.clientY,r:window.innerWidth-r.right,t:r.top,moved:false}; });
+    bRadio.addEventListener('pointermove',function(e){ if(!drag) return; var dx=e.clientX-drag.x, dy=e.clientY-drag.y;
+      if(!drag.moved&&Math.abs(dx)+Math.abs(dy)<10) return; drag.moved=true;
+      box.style.right=Math.max(0,Math.min(window.innerWidth-60,drag.r-dx))+'px'; box.style.top=Math.max(0,Math.min(window.innerHeight-60,drag.t+dy))+'px'; });
+    var endDrag=function(e){ if(!drag) return; var d=drag; drag=null; e.preventDefault(); e.stopPropagation();
+      if(d.moved){ try{ var r=box.getBoundingClientRect(); localStorage.setItem('radio_pos',JSON.stringify({r:Math.round(window.innerWidth-r.right),t:Math.round(r.top)})); }catch(x){} return; }
+      if(e.type!=='pointerup') return;
+      unlock(); if(micStream) micOff(); else micOn(); };
+    bRadio.addEventListener('pointerup',endDrag); bRadio.addEventListener('pointercancel',endDrag);
+    bRadio.addEventListener('click',function(e){ e.preventDefault(); e.stopPropagation(); });
+    var down=function(e){ e.preventDefault(); e.stopPropagation(); try{ bTalk.setPointerCapture(e.pointerId); }catch(x){} unlock(); setTalk(true); render(); };
+    var up=function(e){ e.preventDefault(); e.stopPropagation(); setTalk(false); render(); };
+    bTalk.addEventListener('pointerdown',down); bTalk.addEventListener('pointerup',up); bTalk.addEventListener('pointercancel',up); bTalk.addEventListener('lostpointercapture',up);
+    ['click','touchstart','touchend','mousedown','mouseup'].forEach(function(t){ bTalk.addEventListener(t,function(e){ e.stopPropagation(); if(t!=='touchstart') e.preventDefault(); },{passive:false}); });
+  }
+  function render(){
+    if(!box){ if(document.body) build(); if(!box) return; }
+    var on=!!chan;
+    box.style.display=on?'flex':'none';
+    if(!on) return;
+    expire();
+    var others=0; for(var id in members) others++;
+    var up=relayUp();
+    bRadio.textContent=micStream?'📻 ON ✕':(up?'📻 Radio · '+(others+1):'📻 Radio …');
+    bRadio.className='r'+(micStream?' on':'');
+    bTalk.style.display=micStream?'block':'none';
+    bTalk.className='t'+(talking?' on':'');
+    var who=[], t=nowMs(); if(talking) who.push('tu');
+    for(var id2 in members){ var m=members[id2]; if(m.tk===1||t-m.heard<700){ who.push(m.n); } m.tkShow=0; }
+    var txt=status||(needTap?'Tocca lo schermo per sentire le voci':(who.length?'📻 '+who.join(', '):(t-relayNote<6000?'🛰 collegati tramite rete di riserva':'')));
+    lab.textContent=txt; lab.style.display=txt?'block':'none';
+  }
+  setInterval(render,500);
+  if(document.readyState==='loading') document.addEventListener('DOMContentLoaded',function(){ build(); render(); }); else { build(); render(); }
+  window.addEventListener('pagehide',function(){ try{ if(chan) rpub(chanT(),{t:'bye',id:myId}); }catch(e){} });
+  window.__radioSquadraDbg=function(){ return {chan:chan,members:members,relay:relayUp(),mic:!!micStream,talking:talking,ac:AC&&AC.state}; };
+})();
+</script>
+
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Battaglia">
+<meta name="theme-color" content="#06121f">
+<title>Battaglia Navale e Aerea</title>
+<link rel="apple-touch-icon" id="appicon">
+<script>(()=>{function e(e,t,n,r){Object.defineProperty(e,t,{get:n,set:r,enumerable:!0,configurable:!0})}function t(e){return e&&e.__esModule?e.default:e}class n{constructor(){this.chunkedMTU=16300,this._dataCount=1,this.chunk=e=>{let t=[],n=e.byteLength,r=Math.ceil(n/this.chunkedMTU),i=0,s=0;for(;s<n;){let o=Math.min(n,s+this.chunkedMTU),a=e.slice(s,o),c={__peerData:this._dataCount,n:i,data:a,total:r};t.push(c),s=o,i++}return this._dataCount++,t}}}class r{append_buffer(e){this.flush(),this._parts.push(e)}append(e){this._pieces.push(e)}flush(){if(this._pieces.length>0){let e=new Uint8Array(this._pieces);this._parts.push(e),this._pieces=[]}}toArrayBuffer(){let e=[];for(let t of this._parts)e.push(t);return function(e){let t=0;for(let n of e)t+=n.byteLength;let n=new Uint8Array(t),r=0;for(let t of e){let e=new Uint8Array(t.buffer,t.byteOffset,t.byteLength);n.set(e,r),r+=t.byteLength}return n}(e).buffer}constructor(){this.encoder=new TextEncoder,this._pieces=[],this._parts=[]}}function i(e){return new o(e).unpack()}function s(e){let t=new a,n=t.pack(e);return n instanceof Promise?n.then(()=>t.getBuffer()):t.getBuffer()}class o{unpack(){let e,t=this.unpack_uint8();if(t<128)return t;if((224^t)<32)return(224^t)-32;if((e=160^t)<=15)return this.unpack_raw(e);if((e=176^t)<=15)return this.unpack_string(e);if((e=144^t)<=15)return this.unpack_array(e);if((e=128^t)<=15)return this.unpack_map(e);switch(t){case 192:return null;case 193:case 212:case 213:case 214:case 215:return;case 194:return!1;case 195:return!0;case 202:return this.unpack_float();case 203:return this.unpack_double();case 204:return this.unpack_uint8();case 205:return this.unpack_uint16();case 206:return this.unpack_uint32();case 207:return this.unpack_uint64();case 208:return this.unpack_int8();case 209:return this.unpack_int16();case 210:return this.unpack_int32();case 211:return this.unpack_int64();case 216:return e=this.unpack_uint16(),this.unpack_string(e);case 217:return e=this.unpack_uint32(),this.unpack_string(e);case 218:return e=this.unpack_uint16(),this.unpack_raw(e);case 219:return e=this.unpack_uint32(),this.unpack_raw(e);case 220:return e=this.unpack_uint16(),this.unpack_array(e);case 221:return e=this.unpack_uint32(),this.unpack_array(e);case 222:return e=this.unpack_uint16(),this.unpack_map(e);case 223:return e=this.unpack_uint32(),this.unpack_map(e)}}unpack_uint8(){let e=255&this.dataView[this.index];return this.index++,e}unpack_uint16(){let e=this.read(2),t=(255&e[0])*256+(255&e[1]);return this.index+=2,t}unpack_uint32(){let e=this.read(4),t=((256*e[0]+e[1])*256+e[2])*256+e[3];return this.index+=4,t}unpack_uint64(){let e=this.read(8),t=((((((256*e[0]+e[1])*256+e[2])*256+e[3])*256+e[4])*256+e[5])*256+e[6])*256+e[7];return this.index+=8,t}unpack_int8(){let e=this.unpack_uint8();return e<128?e:e-256}unpack_int16(){let e=this.unpack_uint16();return e<32768?e:e-65536}unpack_int32(){let e=this.unpack_uint32();return e<0x80000000?e:e-0x100000000}unpack_int64(){let e=this.unpack_uint64();return e<0x8000000000000000?e:e-0xffffffffffffffff}unpack_raw(e){if(this.length<this.index+e)throw Error(`BinaryPackFailure: index is out of range ${this.index} ${e} ${this.length}`);let t=this.dataBuffer.slice(this.index,this.index+e);return this.index+=e,t}unpack_string(e){let t,n,r=this.read(e),i=0,s="";for(;i<e;)(t=r[i])<160?(n=t,i++):(192^t)<32?(n=(31&t)<<6|63&r[i+1],i+=2):(224^t)<16?(n=(15&t)<<12|(63&r[i+1])<<6|63&r[i+2],i+=3):(n=(7&t)<<18|(63&r[i+1])<<12|(63&r[i+2])<<6|63&r[i+3],i+=4),s+=String.fromCodePoint(n);return this.index+=e,s}unpack_array(e){let t=Array(e);for(let n=0;n<e;n++)t[n]=this.unpack();return t}unpack_map(e){let t={};for(let n=0;n<e;n++)t[this.unpack()]=this.unpack();return t}unpack_float(){let e=this.unpack_uint32();return(0==e>>31?1:-1)*(8388607&e|8388608)*2**((e>>23&255)-127-23)}unpack_double(){let e=this.unpack_uint32(),t=this.unpack_uint32(),n=(e>>20&2047)-1023;return(0==e>>31?1:-1)*((1048575&e|1048576)*2**(n-20)+t*2**(n-52))}read(e){let t=this.index;if(t+e<=this.length)return this.dataView.subarray(t,t+e);throw Error("BinaryPackFailure: read index out of range")}constructor(e){this.index=0,this.dataBuffer=e,this.dataView=new Uint8Array(this.dataBuffer),this.length=this.dataBuffer.byteLength}}class a{getBuffer(){return this._bufferBuilder.toArrayBuffer()}pack(e){if("string"==typeof e)this.pack_string(e);else if("number"==typeof e)Math.floor(e)===e?this.pack_integer(e):this.pack_double(e);else if("boolean"==typeof e)!0===e?this._bufferBuilder.append(195):!1===e&&this._bufferBuilder.append(194);else if(void 0===e)this._bufferBuilder.append(192);else if("object"==typeof e)if(null===e)this._bufferBuilder.append(192);else{let t=e.constructor;if(e instanceof Array){let t=this.pack_array(e);if(t instanceof Promise)return t.then(()=>this._bufferBuilder.flush())}else if(e instanceof ArrayBuffer)this.pack_bin(new Uint8Array(e));else if("BYTES_PER_ELEMENT"in e)this.pack_bin(new Uint8Array(e.buffer,e.byteOffset,e.byteLength));else if(e instanceof Date)this.pack_string(e.toString());else if(e instanceof Blob)return e.arrayBuffer().then(e=>{this.pack_bin(new Uint8Array(e)),this._bufferBuilder.flush()});else if(t==Object||t.toString().startsWith("class")){let t=this.pack_object(e);if(t instanceof Promise)return t.then(()=>this._bufferBuilder.flush())}else throw Error(`Type "${t.toString()}" not yet supported`)}else throw Error(`Type "${typeof e}" not yet supported`);this._bufferBuilder.flush()}pack_bin(e){let t=e.length;if(t<=15)this.pack_uint8(160+t);else if(t<=65535)this._bufferBuilder.append(218),this.pack_uint16(t);else if(t<=0xffffffff)this._bufferBuilder.append(219),this.pack_uint32(t);else throw Error("Invalid length");this._bufferBuilder.append_buffer(e)}pack_string(e){let t=this._textEncoder.encode(e),n=t.length;if(n<=15)this.pack_uint8(176+n);else if(n<=65535)this._bufferBuilder.append(216),this.pack_uint16(n);else if(n<=0xffffffff)this._bufferBuilder.append(217),this.pack_uint32(n);else throw Error("Invalid length");this._bufferBuilder.append_buffer(t)}pack_array(e){let t=e.length;if(t<=15)this.pack_uint8(144+t);else if(t<=65535)this._bufferBuilder.append(220),this.pack_uint16(t);else if(t<=0xffffffff)this._bufferBuilder.append(221),this.pack_uint32(t);else throw Error("Invalid length");let n=r=>{if(r<t){let t=this.pack(e[r]);return t instanceof Promise?t.then(()=>n(r+1)):n(r+1)}};return n(0)}pack_integer(e){if(e>=-32&&e<=127)this._bufferBuilder.append(255&e);else if(e>=0&&e<=255)this._bufferBuilder.append(204),this.pack_uint8(e);else if(e>=-128&&e<=127)this._bufferBuilder.append(208),this.pack_int8(e);else if(e>=0&&e<=65535)this._bufferBuilder.append(205),this.pack_uint16(e);else if(e>=-32768&&e<=32767)this._bufferBuilder.append(209),this.pack_int16(e);else if(e>=0&&e<=0xffffffff)this._bufferBuilder.append(206),this.pack_uint32(e);else if(e>=-0x80000000&&e<=0x7fffffff)this._bufferBuilder.append(210),this.pack_int32(e);else if(e>=-0x8000000000000000&&e<=0x8000000000000000)this._bufferBuilder.append(211),this.pack_int64(e);else if(e>=0&&e<=0xffffffffffffffff)this._bufferBuilder.append(207),this.pack_uint64(e);else throw Error("Invalid integer")}pack_double(e){let t=0;e<0&&(t=1,e=-e);let n=Math.floor(Math.log(e)/Math.LN2),r=Math.floor((e/2**n-1)*0x10000000000000),i=t<<31|n+1023<<20|r/0x100000000&1048575;this._bufferBuilder.append(203),this.pack_int32(i),this.pack_int32(r%0x100000000)}pack_object(e){let t=Object.keys(e),n=t.length;if(n<=15)this.pack_uint8(128+n);else if(n<=65535)this._bufferBuilder.append(222),this.pack_uint16(n);else if(n<=0xffffffff)this._bufferBuilder.append(223),this.pack_uint32(n);else throw Error("Invalid length");let r=n=>{if(n<t.length){let i=t[n];if(e.hasOwnProperty(i)){this.pack(i);let t=this.pack(e[i]);if(t instanceof Promise)return t.then(()=>r(n+1))}return r(n+1)}};return r(0)}pack_uint8(e){this._bufferBuilder.append(e)}pack_uint16(e){this._bufferBuilder.append(e>>8),this._bufferBuilder.append(255&e)}pack_uint32(e){let t=0|e;this._bufferBuilder.append((0xff000000&t)>>>24),this._bufferBuilder.append((0xff0000&t)>>>16),this._bufferBuilder.append((65280&t)>>>8),this._bufferBuilder.append(255&t)}pack_uint64(e){let t=e/0x100000000,n=e%0x100000000;this._bufferBuilder.append((0xff000000&t)>>>24),this._bufferBuilder.append((0xff0000&t)>>>16),this._bufferBuilder.append((65280&t)>>>8),this._bufferBuilder.append(255&t),this._bufferBuilder.append((0xff000000&n)>>>24),this._bufferBuilder.append((0xff0000&n)>>>16),this._bufferBuilder.append((65280&n)>>>8),this._bufferBuilder.append(255&n)}pack_int8(e){this._bufferBuilder.append(255&e)}pack_int16(e){this._bufferBuilder.append((65280&e)>>8),this._bufferBuilder.append(255&e)}pack_int32(e){this._bufferBuilder.append(e>>>24&255),this._bufferBuilder.append((0xff0000&e)>>>16),this._bufferBuilder.append((65280&e)>>>8),this._bufferBuilder.append(255&e)}pack_int64(e){let t=Math.floor(e/0x100000000),n=e%0x100000000;this._bufferBuilder.append((0xff000000&t)>>>24),this._bufferBuilder.append((0xff0000&t)>>>16),this._bufferBuilder.append((65280&t)>>>8),this._bufferBuilder.append(255&t),this._bufferBuilder.append((0xff000000&n)>>>24),this._bufferBuilder.append((0xff0000&n)>>>16),this._bufferBuilder.append((65280&n)>>>8),this._bufferBuilder.append(255&n)}constructor(){this._bufferBuilder=new r,this._textEncoder=new TextEncoder}}"use strict";let c=!0,p=!0;function d(e,t,n){let r=e.match(t);return r&&r.length>=n&&parseInt(r[n],10)}function l(e,t,n){if(!e.RTCPeerConnection)return;let r=e.RTCPeerConnection.prototype,i=r.addEventListener;r.addEventListener=function(e,r){if(e!==t)return i.apply(this,arguments);let s=e=>{let t=n(e);t&&(r.handleEvent?r.handleEvent(t):r(t))};return this._eventMap=this._eventMap||{},this._eventMap[t]||(this._eventMap[t]=new Map),this._eventMap[t].set(r,s),i.apply(this,[e,s])};let s=r.removeEventListener;r.removeEventListener=function(e,n){if(e!==t||!this._eventMap||!this._eventMap[t]||!this._eventMap[t].has(n))return s.apply(this,arguments);let r=this._eventMap[t].get(n);return this._eventMap[t].delete(n),0===this._eventMap[t].size&&delete this._eventMap[t],0===Object.keys(this._eventMap).length&&delete this._eventMap,s.apply(this,[e,r])},Object.defineProperty(r,"on"+t,{get(){return this["_on"+t]},set(e){this["_on"+t]&&(this.removeEventListener(t,this["_on"+t]),delete this["_on"+t]),e&&this.addEventListener(t,this["_on"+t]=e)},enumerable:!0,configurable:!0})}function h(e){return"boolean"!=typeof e?Error("Argument type: "+typeof e+". Please use a boolean."):(c=e,e?"adapter.js logging disabled":"adapter.js logging enabled")}function u(e){return"boolean"!=typeof e?Error("Argument type: "+typeof e+". Please use a boolean."):(p=!e,"adapter.js deprecation warnings "+(e?"disabled":"enabled"))}function f(){"object"==typeof window&&(c||"undefined"!=typeof console&&"function"==typeof console.log&&console.log.apply(console,arguments))}function m(e,t){p&&console.warn(e+" is deprecated, please use "+t+" instead.")}function _(e){return"[object Object]"===Object.prototype.toString.call(e)}function g(e,t,n){let r=n?"outbound-rtp":"inbound-rtp",i=new Map;if(null===t)return i;let s=[];return e.forEach(e=>{"track"===e.type&&e.trackIdentifier===t.id&&s.push(e)}),s.forEach(t=>{e.forEach(n=>{n.type===r&&n.trackId===t.id&&function e(t,n,r){!n||r.has(n.id)||(r.set(n.id,n),Object.keys(n).forEach(i=>{i.endsWith("Id")?e(t,t.get(n[i]),r):i.endsWith("Ids")&&n[i].forEach(n=>{e(t,t.get(n),r)})}))}(e,n,i)})}),i}"use strict";var y={};function C(e,t){let n=e&&e.navigator;if(!n.mediaDevices)return;let r=function(e){if("object"!=typeof e||e.mandatory||e.optional)return e;let t={};return Object.keys(e).forEach(n=>{if("require"===n||"advanced"===n||"mediaSource"===n)return;let r="object"==typeof e[n]?e[n]:{ideal:e[n]};void 0!==r.exact&&"number"==typeof r.exact&&(r.min=r.max=r.exact);let i=function(e,t){return e?e+t.charAt(0).toUpperCase()+t.slice(1):"deviceId"===t?"sourceId":t};if(void 0!==r.ideal){t.optional=t.optional||[];let e={};"number"==typeof r.ideal?(e[i("min",n)]=r.ideal,t.optional.push(e),(e={})[i("max",n)]=r.ideal):e[i("",n)]=r.ideal,t.optional.push(e)}void 0!==r.exact&&"number"!=typeof r.exact?(t.mandatory=t.mandatory||{},t.mandatory[i("",n)]=r.exact):["min","max"].forEach(e=>{void 0!==r[e]&&(t.mandatory=t.mandatory||{},t.mandatory[i(e,n)]=r[e])})}),e.advanced&&(t.optional=(t.optional||[]).concat(e.advanced)),t},i=function(e,i){if(t.version>=61)return i(e);if((e=JSON.parse(JSON.stringify(e)))&&"object"==typeof e.audio){let t=function(e,t,n){t in e&&!(n in e)&&(e[n]=e[t],delete e[t])};t((e=JSON.parse(JSON.stringify(e))).audio,"autoGainControl","googAutoGainControl"),t(e.audio,"noiseSuppression","googNoiseSuppression"),e.audio=r(e.audio)}if(e&&"object"==typeof e.video){let s=e.video.facingMode;s=s&&("object"==typeof s?s:{ideal:s});let o=t.version<66;if(s&&("user"===s.exact||"environment"===s.exact||"user"===s.ideal||"environment"===s.ideal)&&!(n.mediaDevices.getSupportedConstraints&&n.mediaDevices.getSupportedConstraints().facingMode&&!o)){let t;if(delete e.video.facingMode,"environment"===s.exact||"environment"===s.ideal?t=["back","rear"]:("user"===s.exact||"user"===s.ideal)&&(t=["front"]),t)return n.mediaDevices.enumerateDevices().then(n=>{let o=(n=n.filter(e=>"videoinput"===e.kind)).find(e=>t.some(t=>e.label.toLowerCase().includes(t)));return!o&&n.length&&t.includes("back")&&(o=n[n.length-1]),o&&(e.video.deviceId=s.exact?{exact:o.deviceId}:{ideal:o.deviceId}),e.video=r(e.video),f("chrome: "+JSON.stringify(e)),i(e)})}e.video=r(e.video)}return f("chrome: "+JSON.stringify(e)),i(e)},s=function(e){return t.version>=64?e:{name:({PermissionDeniedError:"NotAllowedError",PermissionDismissedError:"NotAllowedError",InvalidStateError:"NotAllowedError",DevicesNotFoundError:"NotFoundError",ConstraintNotSatisfiedError:"OverconstrainedError",TrackStartError:"NotReadableError",MediaDeviceFailedDueToShutdown:"NotAllowedError",MediaDeviceKillSwitchOn:"NotAllowedError",TabCaptureError:"AbortError",ScreenCaptureError:"AbortError",DeviceCaptureError:"AbortError"})[e.name]||e.name,message:e.message,constraint:e.constraint||e.constraintName,toString(){return this.name+(this.message&&": ")+this.message}}};if(n.getUserMedia=(function(e,t,r){i(e,e=>{n.webkitGetUserMedia(e,t,e=>{r&&r(s(e))})})}).bind(n),n.mediaDevices.getUserMedia){let e=n.mediaDevices.getUserMedia.bind(n.mediaDevices);n.mediaDevices.getUserMedia=function(t){return i(t,t=>e(t).then(e=>{if(t.audio&&!e.getAudioTracks().length||t.video&&!e.getVideoTracks().length)throw e.getTracks().forEach(e=>{e.stop()}),new DOMException("","NotFoundError");return e},e=>Promise.reject(s(e))))}}}"use strict";function v(e){e.MediaStream=e.MediaStream||e.webkitMediaStream}function b(e){if("object"!=typeof e||!e.RTCPeerConnection||"ontrack"in e.RTCPeerConnection.prototype)l(e,"track",e=>(e.transceiver||Object.defineProperty(e,"transceiver",{value:{receiver:e.receiver}}),e));else{Object.defineProperty(e.RTCPeerConnection.prototype,"ontrack",{get(){return this._ontrack},set(e){this._ontrack&&this.removeEventListener("track",this._ontrack),this.addEventListener("track",this._ontrack=e)},enumerable:!0,configurable:!0});let t=e.RTCPeerConnection.prototype.setRemoteDescription;e.RTCPeerConnection.prototype.setRemoteDescription=function(){return this._ontrackpoly||(this._ontrackpoly=t=>{t.stream.addEventListener("addtrack",n=>{let r;r=e.RTCPeerConnection.prototype.getReceivers?this.getReceivers().find(e=>e.track&&e.track.id===n.track.id):{track:n.track};let i=new Event("track");i.track=n.track,i.receiver=r,i.transceiver={receiver:r},i.streams=[t.stream],this.dispatchEvent(i)}),t.stream.getTracks().forEach(n=>{let r;r=e.RTCPeerConnection.prototype.getReceivers?this.getReceivers().find(e=>e.track&&e.track.id===n.id):{track:n};let i=new Event("track");i.track=n,i.receiver=r,i.transceiver={receiver:r},i.streams=[t.stream],this.dispatchEvent(i)})},this.addEventListener("addstream",this._ontrackpoly)),t.apply(this,arguments)}}}function T(e){if("object"==typeof e&&e.RTCPeerConnection&&!("getSenders"in e.RTCPeerConnection.prototype)&&"createDTMFSender"in e.RTCPeerConnection.prototype){let t=function(e,t){return{track:t,get dtmf(){return void 0===this._dtmf&&("audio"===t.kind?this._dtmf=e.createDTMFSender(t):this._dtmf=null),this._dtmf},_pc:e}};if(!e.RTCPeerConnection.prototype.getSenders){e.RTCPeerConnection.prototype.getSenders=function(){return this._senders=this._senders||[],this._senders.slice()};let n=e.RTCPeerConnection.prototype.addTrack;e.RTCPeerConnection.prototype.addTrack=function(e,r){let i=n.apply(this,arguments);return i||(i=t(this,e),this._senders.push(i)),i};let r=e.RTCPeerConnection.prototype.removeTrack;e.RTCPeerConnection.prototype.removeTrack=function(e){r.apply(this,arguments);let t=this._senders.indexOf(e);-1!==t&&this._senders.splice(t,1)}}let n=e.RTCPeerConnection.prototype.addStream;e.RTCPeerConnection.prototype.addStream=function(e){this._senders=this._senders||[],n.apply(this,[e]),e.getTracks().forEach(e=>{this._senders.push(t(this,e))})};let r=e.RTCPeerConnection.prototype.removeStream;e.RTCPeerConnection.prototype.removeStream=function(e){this._senders=this._senders||[],r.apply(this,[e]),e.getTracks().forEach(e=>{let t=this._senders.find(t=>t.track===e);t&&this._senders.splice(this._senders.indexOf(t),1)})}}else if("object"==typeof e&&e.RTCPeerConnection&&"getSenders"in e.RTCPeerConnection.prototype&&"createDTMFSender"in e.RTCPeerConnection.prototype&&e.RTCRtpSender&&!("dtmf"in e.RTCRtpSender.prototype)){let t=e.RTCPeerConnection.prototype.getSenders;e.RTCPeerConnection.prototype.getSenders=function(){let e=t.apply(this,[]);return e.forEach(e=>e._pc=this),e},Object.defineProperty(e.RTCRtpSender.prototype,"dtmf",{get(){return void 0===this._dtmf&&("audio"===this.track.kind?this._dtmf=this._pc.createDTMFSender(this.track):this._dtmf=null),this._dtmf}})}}function S(e){if(!("object"==typeof e&&e.RTCPeerConnection&&e.RTCRtpSender&&e.RTCRtpReceiver))return;if(!("getStats"in e.RTCRtpSender.prototype)){let t=e.RTCPeerConnection.prototype.getSenders;t&&(e.RTCPeerConnection.prototype.getSenders=function(){let e=t.apply(this,[]);return e.forEach(e=>e._pc=this),e});let n=e.RTCPeerConnection.prototype.addTrack;n&&(e.RTCPeerConnection.prototype.addTrack=function(){let e=n.apply(this,arguments);return e._pc=this,e}),e.RTCRtpSender.prototype.getStats=function(){let e=this;return this._pc.getStats().then(t=>g(t,e.track,!0))}}if(!("getStats"in e.RTCRtpReceiver.prototype)){let t=e.RTCPeerConnection.prototype.getReceivers;t&&(e.RTCPeerConnection.prototype.getReceivers=function(){let e=t.apply(this,[]);return e.forEach(e=>e._pc=this),e}),l(e,"track",e=>(e.receiver._pc=e.srcElement,e)),e.RTCRtpReceiver.prototype.getStats=function(){let e=this;return this._pc.getStats().then(t=>g(t,e.track,!1))}}if(!("getStats"in e.RTCRtpSender.prototype&&"getStats"in e.RTCRtpReceiver.prototype))return;let t=e.RTCPeerConnection.prototype.getStats;e.RTCPeerConnection.prototype.getStats=function(){if(arguments.length>0&&arguments[0]instanceof e.MediaStreamTrack){let e,t,n,r=arguments[0];return(this.getSenders().forEach(t=>{t.track===r&&(e?n=!0:e=t)}),this.getReceivers().forEach(e=>(e.track===r&&(t?n=!0:t=e),e.track===r)),n||e&&t)?Promise.reject(new DOMException("There are more than one sender or receiver for the track.","InvalidAccessError")):e?e.getStats():t?t.getStats():Promise.reject(new DOMException("There is no sender or receiver for the track.","InvalidAccessError"))}return t.apply(this,arguments)}}function k(e){e.RTCPeerConnection.prototype.getLocalStreams=function(){return this._shimmedLocalStreams=this._shimmedLocalStreams||{},Object.keys(this._shimmedLocalStreams).map(e=>this._shimmedLocalStreams[e][0])};let t=e.RTCPeerConnection.prototype.addTrack;e.RTCPeerConnection.prototype.addTrack=function(e,n){if(!n)return t.apply(this,arguments);this._shimmedLocalStreams=this._shimmedLocalStreams||{};let r=t.apply(this,arguments);return this._shimmedLocalStreams[n.id]?-1===this._shimmedLocalStreams[n.id].indexOf(r)&&this._shimmedLocalStreams[n.id].push(r):this._shimmedLocalStreams[n.id]=[n,r],r};let n=e.RTCPeerConnection.prototype.addStream;e.RTCPeerConnection.prototype.addStream=function(e){this._shimmedLocalStreams=this._shimmedLocalStreams||{},e.getTracks().forEach(e=>{if(this.getSenders().find(t=>t.track===e))throw new DOMException("Track already exists.","InvalidAccessError")});let t=this.getSenders();n.apply(this,arguments);let r=this.getSenders().filter(e=>-1===t.indexOf(e));this._shimmedLocalStreams[e.id]=[e].concat(r)};let r=e.RTCPeerConnection.prototype.removeStream;e.RTCPeerConnection.prototype.removeStream=function(e){return this._shimmedLocalStreams=this._shimmedLocalStreams||{},delete this._shimmedLocalStreams[e.id],r.apply(this,arguments)};let i=e.RTCPeerConnection.prototype.removeTrack;e.RTCPeerConnection.prototype.removeTrack=function(e){return this._shimmedLocalStreams=this._shimmedLocalStreams||{},e&&Object.keys(this._shimmedLocalStreams).forEach(t=>{let n=this._shimmedLocalStreams[t].indexOf(e);-1!==n&&this._shimmedLocalStreams[t].splice(n,1),1===this._shimmedLocalStreams[t].length&&delete this._shimmedLocalStreams[t]}),i.apply(this,arguments)}}function R(e,t){if(!e.RTCPeerConnection)return;if(e.RTCPeerConnection.prototype.addTrack&&t.version>=65)return k(e);let n=e.RTCPeerConnection.prototype.getLocalStreams;e.RTCPeerConnection.prototype.getLocalStreams=function(){let e=n.apply(this);return this._reverseStreams=this._reverseStreams||{},e.map(e=>this._reverseStreams[e.id])};let r=e.RTCPeerConnection.prototype.addStream;e.RTCPeerConnection.prototype.addStream=function(t){if(this._streams=this._streams||{},this._reverseStreams=this._reverseStreams||{},t.getTracks().forEach(e=>{if(this.getSenders().find(t=>t.track===e))throw new DOMException("Track already exists.","InvalidAccessError")}),!this._reverseStreams[t.id]){let n=new e.MediaStream(t.getTracks());this._streams[t.id]=n,this._reverseStreams[n.id]=t,t=n}r.apply(this,[t])};let i=e.RTCPeerConnection.prototype.removeStream;function s(e,t){let n=t.sdp;return Object.keys(e._reverseStreams||[]).forEach(t=>{let r=e._reverseStreams[t],i=e._streams[r.id];n=n.replace(RegExp(i.id,"g"),r.id)}),new RTCSessionDescription({type:t.type,sdp:n})}e.RTCPeerConnection.prototype.removeStream=function(e){this._streams=this._streams||{},this._reverseStreams=this._reverseStreams||{},i.apply(this,[this._streams[e.id]||e]),delete this._reverseStreams[this._streams[e.id]?this._streams[e.id].id:e.id],delete this._streams[e.id]},e.RTCPeerConnection.prototype.addTrack=function(t,n){if("closed"===this.signalingState)throw new DOMException("The RTCPeerConnection's signalingState is 'closed'.","InvalidStateError");let r=[].slice.call(arguments,1);if(1!==r.length||!r[0].getTracks().find(e=>e===t))throw new DOMException("The adapter.js addTrack polyfill only supports a single  stream which is associated with the specified track.","NotSupportedError");if(this.getSenders().find(e=>e.track===t))throw new DOMException("Track already exists.","InvalidAccessError");this._streams=this._streams||{},this._reverseStreams=this._reverseStreams||{};let i=this._streams[n.id];if(i)i.addTrack(t),Promise.resolve().then(()=>{this.dispatchEvent(new Event("negotiationneeded"))});else{let r=new e.MediaStream([t]);this._streams[n.id]=r,this._reverseStreams[r.id]=n,this.addStream(r)}return this.getSenders().find(e=>e.track===t)},["createOffer","createAnswer"].forEach(function(t){let n=e.RTCPeerConnection.prototype[t];e.RTCPeerConnection.prototype[t]=({[t](){let e=arguments,t=arguments.length&&"function"==typeof arguments[0];return t?n.apply(this,[t=>{let n=s(this,t);e[0].apply(null,[n])},t=>{e[1]&&e[1].apply(null,t)},arguments[2]]):n.apply(this,arguments).then(e=>s(this,e))}})[t]});let o=e.RTCPeerConnection.prototype.setLocalDescription;e.RTCPeerConnection.prototype.setLocalDescription=function(){var e,t;let n;return arguments.length&&arguments[0].type?(arguments[0]=(e=this,t=arguments[0],n=t.sdp,Object.keys(e._reverseStreams||[]).forEach(t=>{let r=e._reverseStreams[t],i=e._streams[r.id];n=n.replace(RegExp(r.id,"g"),i.id)}),new RTCSessionDescription({type:t.type,sdp:n})),o.apply(this,arguments)):o.apply(this,arguments)};let a=Object.getOwnPropertyDescriptor(e.RTCPeerConnection.prototype,"localDescription");Object.defineProperty(e.RTCPeerConnection.prototype,"localDescription",{get(){let e=a.get.apply(this);return""===e.type?e:s(this,e)}}),e.RTCPeerConnection.prototype.removeTrack=function(e){let t;if("closed"===this.signalingState)throw new DOMException("The RTCPeerConnection's signalingState is 'closed'.","InvalidStateError");if(!e._pc)throw new DOMException("Argument 1 of RTCPeerConnection.removeTrack does not implement interface RTCRtpSender.","TypeError");if(e._pc!==this)throw new DOMException("Sender was not created by this connection.","InvalidAccessError");this._streams=this._streams||{},Object.keys(this._streams).forEach(n=>{this._streams[n].getTracks().find(t=>e.track===t)&&(t=this._streams[n])}),t&&(1===t.getTracks().length?this.removeStream(this._reverseStreams[t.id]):t.removeTrack(e.track),this.dispatchEvent(new Event("negotiationneeded")))}}function P(e,t){!e.RTCPeerConnection&&e.webkitRTCPeerConnection&&(e.RTCPeerConnection=e.webkitRTCPeerConnection),e.RTCPeerConnection&&t.version<53&&["setLocalDescription","setRemoteDescription","addIceCandidate"].forEach(function(t){let n=e.RTCPeerConnection.prototype[t];e.RTCPeerConnection.prototype[t]=({[t](){return arguments[0]=new("addIceCandidate"===t?e.RTCIceCandidate:e.RTCSessionDescription)(arguments[0]),n.apply(this,arguments)}})[t]})}function w(e,t){l(e,"negotiationneeded",e=>{let n=e.target;if(!(t.version<72)&&(!n.getConfiguration||"plan-b"!==n.getConfiguration().sdpSemantics)||"stable"===n.signalingState)return e})}"use strict";e(y,"shimMediaStream",()=>v),e(y,"shimOnTrack",()=>b),e(y,"shimGetSendersWithDtmf",()=>T),e(y,"shimSenderReceiverGetStats",()=>S),e(y,"shimAddTrackRemoveTrackWithNative",()=>k),e(y,"shimAddTrackRemoveTrack",()=>R),e(y,"shimPeerConnection",()=>P),e(y,"fixNegotiationNeeded",()=>w),e(y,"shimGetUserMedia",()=>C);var E={};function x(e,t){let n=e&&e.navigator,r=e&&e.MediaStreamTrack;if(n.getUserMedia=function(e,t,r){m("navigator.getUserMedia","navigator.mediaDevices.getUserMedia"),n.mediaDevices.getUserMedia(e).then(t,r)},!(t.version>55&&"autoGainControl"in n.mediaDevices.getSupportedConstraints())){let e=function(e,t,n){t in e&&!(n in e)&&(e[n]=e[t],delete e[t])},t=n.mediaDevices.getUserMedia.bind(n.mediaDevices);if(n.mediaDevices.getUserMedia=function(n){return"object"==typeof n&&"object"==typeof n.audio&&(e((n=JSON.parse(JSON.stringify(n))).audio,"autoGainControl","mozAutoGainControl"),e(n.audio,"noiseSuppression","mozNoiseSuppression")),t(n)},r&&r.prototype.getSettings){let t=r.prototype.getSettings;r.prototype.getSettings=function(){let n=t.apply(this,arguments);return e(n,"mozAutoGainControl","autoGainControl"),e(n,"mozNoiseSuppression","noiseSuppression"),n}}if(r&&r.prototype.applyConstraints){let t=r.prototype.applyConstraints;r.prototype.applyConstraints=function(n){return"audio"===this.kind&&"object"==typeof n&&(e(n=JSON.parse(JSON.stringify(n)),"autoGainControl","mozAutoGainControl"),e(n,"noiseSuppression","mozNoiseSuppression")),t.apply(this,[n])}}}}"use strict";function D(e,t){e.navigator.mediaDevices&&"getDisplayMedia"in e.navigator.mediaDevices||e.navigator.mediaDevices&&(e.navigator.mediaDevices.getDisplayMedia=function(n){if(!(n&&n.video)){let e=new DOMException("getDisplayMedia without video constraints is undefined");return e.name="NotFoundError",e.code=8,Promise.reject(e)}return!0===n.video?n.video={mediaSource:t}:n.video.mediaSource=t,e.navigator.mediaDevices.getUserMedia(n)})}"use strict";function I(e){"object"==typeof e&&e.RTCTrackEvent&&"receiver"in e.RTCTrackEvent.prototype&&!("transceiver"in e.RTCTrackEvent.prototype)&&Object.defineProperty(e.RTCTrackEvent.prototype,"transceiver",{get(){return{receiver:this.receiver}}})}function M(e,t){if("object"!=typeof e||!(e.RTCPeerConnection||e.mozRTCPeerConnection))return;!e.RTCPeerConnection&&e.mozRTCPeerConnection&&(e.RTCPeerConnection=e.mozRTCPeerConnection),t.version<53&&["setLocalDescription","setRemoteDescription","addIceCandidate"].forEach(function(t){let n=e.RTCPeerConnection.prototype[t];e.RTCPeerConnection.prototype[t]=({[t](){return arguments[0]=new("addIceCandidate"===t?e.RTCIceCandidate:e.RTCSessionDescription)(arguments[0]),n.apply(this,arguments)}})[t]});let n={inboundrtp:"inbound-rtp",outboundrtp:"outbound-rtp",candidatepair:"candidate-pair",localcandidate:"local-candidate",remotecandidate:"remote-candidate"},r=e.RTCPeerConnection.prototype.getStats;e.RTCPeerConnection.prototype.getStats=function(){let[e,i,s]=arguments;return r.apply(this,[e||null]).then(e=>{if(t.version<53&&!i)try{e.forEach(e=>{e.type=n[e.type]||e.type})}catch(t){if("TypeError"!==t.name)throw t;e.forEach((t,r)=>{e.set(r,Object.assign({},t,{type:n[t.type]||t.type}))})}return e}).then(i,s)}}function O(e){if(!("object"==typeof e&&e.RTCPeerConnection&&e.RTCRtpSender)||e.RTCRtpSender&&"getStats"in e.RTCRtpSender.prototype)return;let t=e.RTCPeerConnection.prototype.getSenders;t&&(e.RTCPeerConnection.prototype.getSenders=function(){let e=t.apply(this,[]);return e.forEach(e=>e._pc=this),e});let n=e.RTCPeerConnection.prototype.addTrack;n&&(e.RTCPeerConnection.prototype.addTrack=function(){let e=n.apply(this,arguments);return e._pc=this,e}),e.RTCRtpSender.prototype.getStats=function(){return this.track?this._pc.getStats(this.track):Promise.resolve(new Map)}}function L(e){if(!("object"==typeof e&&e.RTCPeerConnection&&e.RTCRtpSender)||e.RTCRtpSender&&"getStats"in e.RTCRtpReceiver.prototype)return;let t=e.RTCPeerConnection.prototype.getReceivers;t&&(e.RTCPeerConnection.prototype.getReceivers=function(){let e=t.apply(this,[]);return e.forEach(e=>e._pc=this),e}),l(e,"track",e=>(e.receiver._pc=e.srcElement,e)),e.RTCRtpReceiver.prototype.getStats=function(){return this._pc.getStats(this.track)}}function A(e){!e.RTCPeerConnection||"removeStream"in e.RTCPeerConnection.prototype||(e.RTCPeerConnection.prototype.removeStream=function(e){m("removeStream","removeTrack"),this.getSenders().forEach(t=>{t.track&&e.getTracks().includes(t.track)&&this.removeTrack(t)})})}function j(e){e.DataChannel&&!e.RTCDataChannel&&(e.RTCDataChannel=e.DataChannel)}function B(e){if(!("object"==typeof e&&e.RTCPeerConnection))return;let t=e.RTCPeerConnection.prototype.addTransceiver;t&&(e.RTCPeerConnection.prototype.addTransceiver=function(){this.setParametersPromises=[];let e=arguments[1]&&arguments[1].sendEncodings;void 0===e&&(e=[]);let n=(e=[...e]).length>0;n&&e.forEach(e=>{if("rid"in e&&!/^[a-z0-9]{0,16}$/i.test(e.rid))throw TypeError("Invalid RID value provided.");if("scaleResolutionDownBy"in e&&!(parseFloat(e.scaleResolutionDownBy)>=1))throw RangeError("scale_resolution_down_by must be >= 1.0");if("maxFramerate"in e&&!(parseFloat(e.maxFramerate)>=0))throw RangeError("max_framerate must be >= 0.0")});let r=t.apply(this,arguments);if(n){let{sender:t}=r,n=t.getParameters();"encodings"in n&&(1!==n.encodings.length||0!==Object.keys(n.encodings[0]).length)||(n.encodings=e,t.sendEncodings=e,this.setParametersPromises.push(t.setParameters(n).then(()=>{delete t.sendEncodings}).catch(()=>{delete t.sendEncodings})))}return r})}function U(e){if(!("object"==typeof e&&e.RTCRtpSender))return;let t=e.RTCRtpSender.prototype.getParameters;t&&(e.RTCRtpSender.prototype.getParameters=function(){let e=t.apply(this,arguments);return"encodings"in e||(e.encodings=[].concat(this.sendEncodings||[{}])),e})}function F(e){if(!("object"==typeof e&&e.RTCPeerConnection))return;let t=e.RTCPeerConnection.prototype.createOffer;e.RTCPeerConnection.prototype.createOffer=function(){return this.setParametersPromises&&this.setParametersPromises.length?Promise.all(this.setParametersPromises).then(()=>t.apply(this,arguments)).finally(()=>{this.setParametersPromises=[]}):t.apply(this,arguments)}}function N(e){if(!("object"==typeof e&&e.RTCPeerConnection))return;let t=e.RTCPeerConnection.prototype.createAnswer;e.RTCPeerConnection.prototype.createAnswer=function(){return this.setParametersPromises&&this.setParametersPromises.length?Promise.all(this.setParametersPromises).then(()=>t.apply(this,arguments)).finally(()=>{this.setParametersPromises=[]}):t.apply(this,arguments)}}"use strict";e(E,"shimOnTrack",()=>I),e(E,"shimPeerConnection",()=>M),e(E,"shimSenderGetStats",()=>O),e(E,"shimReceiverGetStats",()=>L),e(E,"shimRemoveStream",()=>A),e(E,"shimRTCDataChannel",()=>j),e(E,"shimAddTransceiver",()=>B),e(E,"shimGetParameters",()=>U),e(E,"shimCreateOffer",()=>F),e(E,"shimCreateAnswer",()=>N),e(E,"shimGetUserMedia",()=>x),e(E,"shimGetDisplayMedia",()=>D);var z={};function $(e){if("object"==typeof e&&e.RTCPeerConnection){if("getLocalStreams"in e.RTCPeerConnection.prototype||(e.RTCPeerConnection.prototype.getLocalStreams=function(){return this._localStreams||(this._localStreams=[]),this._localStreams}),!("addStream"in e.RTCPeerConnection.prototype)){let t=e.RTCPeerConnection.prototype.addTrack;e.RTCPeerConnection.prototype.addStream=function(e){this._localStreams||(this._localStreams=[]),this._localStreams.includes(e)||this._localStreams.push(e),e.getAudioTracks().forEach(n=>t.call(this,n,e)),e.getVideoTracks().forEach(n=>t.call(this,n,e))},e.RTCPeerConnection.prototype.addTrack=function(e,...n){return n&&n.forEach(e=>{this._localStreams?this._localStreams.includes(e)||this._localStreams.push(e):this._localStreams=[e]}),t.apply(this,arguments)}}"removeStream"in e.RTCPeerConnection.prototype||(e.RTCPeerConnection.prototype.removeStream=function(e){this._localStreams||(this._localStreams=[]);let t=this._localStreams.indexOf(e);if(-1===t)return;this._localStreams.splice(t,1);let n=e.getTracks();this.getSenders().forEach(e=>{n.includes(e.track)&&this.removeTrack(e)})})}}function V(e){if("object"==typeof e&&e.RTCPeerConnection&&("getRemoteStreams"in e.RTCPeerConnection.prototype||(e.RTCPeerConnection.prototype.getRemoteStreams=function(){return this._remoteStreams?this._remoteStreams:[]}),!("onaddstream"in e.RTCPeerConnection.prototype))){Object.defineProperty(e.RTCPeerConnection.prototype,"onaddstream",{get(){return this._onaddstream},set(e){this._onaddstream&&(this.removeEventListener("addstream",this._onaddstream),this.removeEventListener("track",this._onaddstreampoly)),this.addEventListener("addstream",this._onaddstream=e),this.addEventListener("track",this._onaddstreampoly=e=>{e.streams.forEach(e=>{if(this._remoteStreams||(this._remoteStreams=[]),this._remoteStreams.includes(e))return;this._remoteStreams.push(e);let t=new Event("addstream");t.stream=e,this.dispatchEvent(t)})})}});let t=e.RTCPeerConnection.prototype.setRemoteDescription;e.RTCPeerConnection.prototype.setRemoteDescription=function(){let e=this;return this._onaddstreampoly||this.addEventListener("track",this._onaddstreampoly=function(t){t.streams.forEach(t=>{if(e._remoteStreams||(e._remoteStreams=[]),e._remoteStreams.indexOf(t)>=0)return;e._remoteStreams.push(t);let n=new Event("addstream");n.stream=t,e.dispatchEvent(n)})}),t.apply(e,arguments)}}}function G(e){if("object"!=typeof e||!e.RTCPeerConnection)return;let t=e.RTCPeerConnection.prototype,n=t.createOffer,r=t.createAnswer,i=t.setLocalDescription,s=t.setRemoteDescription,o=t.addIceCandidate;t.createOffer=function(e,t){let r=arguments.length>=2?arguments[2]:arguments[0],i=n.apply(this,[r]);return t?(i.then(e,t),Promise.resolve()):i},t.createAnswer=function(e,t){let n=arguments.length>=2?arguments[2]:arguments[0],i=r.apply(this,[n]);return t?(i.then(e,t),Promise.resolve()):i};let a=function(e,t,n){let r=i.apply(this,[e]);return n?(r.then(t,n),Promise.resolve()):r};t.setLocalDescription=a,t.setRemoteDescription=a=function(e,t,n){let r=s.apply(this,[e]);return n?(r.then(t,n),Promise.resolve()):r},t.addIceCandidate=function(e,t,n){let r=o.apply(this,[e]);return n?(r.then(t,n),Promise.resolve()):r}}function J(e){let t=e&&e.navigator;if(t.mediaDevices&&t.mediaDevices.getUserMedia){let e=t.mediaDevices,n=e.getUserMedia.bind(e);t.mediaDevices.getUserMedia=e=>n(W(e))}!t.getUserMedia&&t.mediaDevices&&t.mediaDevices.getUserMedia&&(t.getUserMedia=(function(e,n,r){t.mediaDevices.getUserMedia(e).then(n,r)}).bind(t))}function W(e){return e&&void 0!==e.video?Object.assign({},e,{video:function e(t){return _(t)?Object.keys(t).reduce(function(n,r){let i=_(t[r]),s=i?e(t[r]):t[r],o=i&&!Object.keys(s).length;return void 0===s||o?n:Object.assign(n,{[r]:s})},{}):t}(e.video)}):e}function Y(e){if(!e.RTCPeerConnection)return;let t=e.RTCPeerConnection;e.RTCPeerConnection=function(e,n){if(e&&e.iceServers){let t=[];for(let n=0;n<e.iceServers.length;n++){let r=e.iceServers[n];void 0===r.urls&&r.url?(m("RTCIceServer.url","RTCIceServer.urls"),(r=JSON.parse(JSON.stringify(r))).urls=r.url,delete r.url,t.push(r)):t.push(e.iceServers[n])}e.iceServers=t}return new t(e,n)},e.RTCPeerConnection.prototype=t.prototype,"generateCertificate"in t&&Object.defineProperty(e.RTCPeerConnection,"generateCertificate",{get:()=>t.generateCertificate})}function H(e){"object"==typeof e&&e.RTCTrackEvent&&"receiver"in e.RTCTrackEvent.prototype&&!("transceiver"in e.RTCTrackEvent.prototype)&&Object.defineProperty(e.RTCTrackEvent.prototype,"transceiver",{get(){return{receiver:this.receiver}}})}function K(e){let t=e.RTCPeerConnection.prototype.createOffer;e.RTCPeerConnection.prototype.createOffer=function(e){if(e){void 0!==e.offerToReceiveAudio&&(e.offerToReceiveAudio=!!e.offerToReceiveAudio);let t=this.getTransceivers().find(e=>"audio"===e.receiver.track.kind);!1===e.offerToReceiveAudio&&t?"sendrecv"===t.direction?t.setDirection?t.setDirection("sendonly"):t.direction="sendonly":"recvonly"===t.direction&&(t.setDirection?t.setDirection("inactive"):t.direction="inactive"):!0!==e.offerToReceiveAudio||t||this.addTransceiver("audio",{direction:"recvonly"}),void 0!==e.offerToReceiveVideo&&(e.offerToReceiveVideo=!!e.offerToReceiveVideo);let n=this.getTransceivers().find(e=>"video"===e.receiver.track.kind);!1===e.offerToReceiveVideo&&n?"sendrecv"===n.direction?n.setDirection?n.setDirection("sendonly"):n.direction="sendonly":"recvonly"===n.direction&&(n.setDirection?n.setDirection("inactive"):n.direction="inactive"):!0!==e.offerToReceiveVideo||n||this.addTransceiver("video",{direction:"recvonly"})}return t.apply(this,arguments)}}function X(e){"object"!=typeof e||e.AudioContext||(e.AudioContext=e.webkitAudioContext)}e(z,"shimLocalStreamsAPI",()=>$),e(z,"shimRemoteStreamsAPI",()=>V),e(z,"shimCallbacksAPI",()=>G),e(z,"shimGetUserMedia",()=>J),e(z,"shimConstraints",()=>W),e(z,"shimRTCIceServerUrls",()=>Y),e(z,"shimTrackEventTransceiver",()=>H),e(z,"shimCreateOfferLegacy",()=>K),e(z,"shimAudioContext",()=>X);var Q={};"use strict";e(Q,"shimRTCIceCandidate",()=>ee),e(Q,"shimRTCIceCandidateRelayProtocol",()=>et),e(Q,"shimMaxMessageSize",()=>en),e(Q,"shimSendThrowTypeError",()=>er),e(Q,"shimConnectionState",()=>ei),e(Q,"removeExtmapAllowMixed",()=>es),e(Q,"shimAddIceCandidateNullOrEmpty",()=>eo),e(Q,"shimParameterlessSetLocalDescription",()=>ea);var q={};"use strict";let Z={};function ee(e){if(!e.RTCIceCandidate||e.RTCIceCandidate&&"foundation"in e.RTCIceCandidate.prototype)return;let n=e.RTCIceCandidate;e.RTCIceCandidate=function(e){if("object"==typeof e&&e.candidate&&0===e.candidate.indexOf("a=")&&((e=JSON.parse(JSON.stringify(e))).candidate=e.candidate.substring(2)),e.candidate&&e.candidate.length){let r=new n(e),i=t(q).parseCandidate(e.candidate);for(let e in i)e in r||Object.defineProperty(r,e,{value:i[e]});return r.toJSON=function(){return{candidate:r.candidate,sdpMid:r.sdpMid,sdpMLineIndex:r.sdpMLineIndex,usernameFragment:r.usernameFragment}},r}return new n(e)},e.RTCIceCandidate.prototype=n.prototype,l(e,"icecandidate",t=>(t.candidate&&Object.defineProperty(t,"candidate",{value:new e.RTCIceCandidate(t.candidate),writable:"false"}),t))}function et(e){!e.RTCIceCandidate||e.RTCIceCandidate&&"relayProtocol"in e.RTCIceCandidate.prototype||l(e,"icecandidate",e=>{if(e.candidate){let n=t(q).parseCandidate(e.candidate.candidate);"relay"===n.type&&(e.candidate.relayProtocol=({0:"tls",1:"tcp",2:"udp"})[n.priority>>24])}return e})}function en(e,n){if(!e.RTCPeerConnection)return;"sctp"in e.RTCPeerConnection.prototype||Object.defineProperty(e.RTCPeerConnection.prototype,"sctp",{get(){return void 0===this._sctp?null:this._sctp}});let r=function(e){if(!e||!e.sdp)return!1;let n=t(q).splitSections(e.sdp);return n.shift(),n.some(e=>{let n=t(q).parseMLine(e);return n&&"application"===n.kind&&-1!==n.protocol.indexOf("SCTP")})},i=function(e){let t=e.sdp.match(/mozilla...THIS_IS_SDPARTA-(\d+)/);if(null===t||t.length<2)return -1;let n=parseInt(t[1],10);return n!=n?-1:n},s=function(e){let t=65536;return"firefox"===n.browser&&(t=n.version<57?-1===e?16384:0x7ffffff5:n.version<60?57===n.version?65535:65536:0x7ffffff5),t},o=function(e,r){let i=65536;"firefox"===n.browser&&57===n.version&&(i=65535);let s=t(q).matchPrefix(e.sdp,"a=max-message-size:");return s.length>0?i=parseInt(s[0].substring(19),10):"firefox"===n.browser&&-1!==r&&(i=0x7ffffff5),i},a=e.RTCPeerConnection.prototype.setRemoteDescription;e.RTCPeerConnection.prototype.setRemoteDescription=function(){if(this._sctp=null,"chrome"===n.browser&&n.version>=76){let{sdpSemantics:e}=this.getConfiguration();"plan-b"===e&&Object.defineProperty(this,"sctp",{get(){return void 0===this._sctp?null:this._sctp},enumerable:!0,configurable:!0})}if(r(arguments[0])){let e,t=i(arguments[0]),n=s(t),r=o(arguments[0],t);e=0===n&&0===r?Number.POSITIVE_INFINITY:0===n||0===r?Math.max(n,r):Math.min(n,r);let a={};Object.defineProperty(a,"maxMessageSize",{get:()=>e}),this._sctp=a}return a.apply(this,arguments)}}function er(e){if(!(e.RTCPeerConnection&&"createDataChannel"in e.RTCPeerConnection.prototype))return;function t(e,t){let n=e.send;e.send=function(){let r=arguments[0],i=r.length||r.size||r.byteLength;if("open"===e.readyState&&t.sctp&&i>t.sctp.maxMessageSize)throw TypeError("Message too large (can send a maximum of "+t.sctp.maxMessageSize+" bytes)");return n.apply(e,arguments)}}let n=e.RTCPeerConnection.prototype.createDataChannel;e.RTCPeerConnection.prototype.createDataChannel=function(){let e=n.apply(this,arguments);return t(e,this),e},l(e,"datachannel",e=>(t(e.channel,e.target),e))}function ei(e){if(!e.RTCPeerConnection||"connectionState"in e.RTCPeerConnection.prototype)return;let t=e.RTCPeerConnection.prototype;Object.defineProperty(t,"connectionState",{get(){return({completed:"connected",checking:"connecting"})[this.iceConnectionState]||this.iceConnectionState},enumerable:!0,configurable:!0}),Object.defineProperty(t,"onconnectionstatechange",{get(){return this._onconnectionstatechange||null},set(e){this._onconnectionstatechange&&(this.removeEventListener("connectionstatechange",this._onconnectionstatechange),delete this._onconnectionstatechange),e&&this.addEventListener("connectionstatechange",this._onconnectionstatechange=e)},enumerable:!0,configurable:!0}),["setLocalDescription","setRemoteDescription"].forEach(e=>{let n=t[e];t[e]=function(){return this._connectionstatechangepoly||(this._connectionstatechangepoly=e=>{let t=e.target;if(t._lastConnectionState!==t.connectionState){t._lastConnectionState=t.connectionState;let n=new Event("connectionstatechange",e);t.dispatchEvent(n)}return e},this.addEventListener("iceconnectionstatechange",this._connectionstatechangepoly)),n.apply(this,arguments)}})}function es(e,t){if(!e.RTCPeerConnection||"chrome"===t.browser&&t.version>=71||"safari"===t.browser&&t.version>=605)return;let n=e.RTCPeerConnection.prototype.setRemoteDescription;e.RTCPeerConnection.prototype.setRemoteDescription=function(t){if(t&&t.sdp&&-1!==t.sdp.indexOf("\na=extmap-allow-mixed")){let n=t.sdp.split("\n").filter(e=>"a=extmap-allow-mixed"!==e.trim()).join("\n");e.RTCSessionDescription&&t instanceof e.RTCSessionDescription?arguments[0]=new e.RTCSessionDescription({type:t.type,sdp:n}):t.sdp=n}return n.apply(this,arguments)}}function eo(e,t){if(!(e.RTCPeerConnection&&e.RTCPeerConnection.prototype))return;let n=e.RTCPeerConnection.prototype.addIceCandidate;n&&0!==n.length&&(e.RTCPeerConnection.prototype.addIceCandidate=function(){return arguments[0]?("chrome"===t.browser&&t.version<78||"firefox"===t.browser&&t.version<68||"safari"===t.browser)&&arguments[0]&&""===arguments[0].candidate?Promise.resolve():n.apply(this,arguments):(arguments[1]&&arguments[1].apply(null),Promise.resolve())})}function ea(e,t){if(!(e.RTCPeerConnection&&e.RTCPeerConnection.prototype))return;let n=e.RTCPeerConnection.prototype.setLocalDescription;n&&0!==n.length&&(e.RTCPeerConnection.prototype.setLocalDescription=function(){let e=arguments[0]||{};if("object"!=typeof e||e.type&&e.sdp)return n.apply(this,arguments);if(!(e={type:e.type,sdp:e.sdp}).type)switch(this.signalingState){case"stable":case"have-local-offer":case"have-remote-pranswer":e.type="offer";break;default:e.type="answer"}return e.sdp||"offer"!==e.type&&"answer"!==e.type?n.apply(this,[e]):("offer"===e.type?this.createOffer:this.createAnswer).apply(this).then(e=>n.apply(this,[e]))})}"use strict";Z.generateIdentifier=function(){return Math.random().toString(36).substring(2,12)},Z.localCName=Z.generateIdentifier(),Z.splitLines=function(e){return e.trim().split("\n").map(e=>e.trim())},Z.splitSections=function(e){return e.split("\nm=").map((e,t)=>(t>0?"m="+e:e).trim()+"\r\n")},Z.getDescription=function(e){let t=Z.splitSections(e);return t&&t[0]},Z.getMediaSections=function(e){let t=Z.splitSections(e);return t.shift(),t},Z.matchPrefix=function(e,t){return Z.splitLines(e).filter(e=>0===e.indexOf(t))},Z.parseCandidate=function(e){let t,n={foundation:(t=0===e.indexOf("a=candidate:")?e.substring(12).split(" "):e.substring(10).split(" "))[0],component:{1:"rtp",2:"rtcp"}[t[1]]||t[1],protocol:t[2].toLowerCase(),priority:parseInt(t[3],10),ip:t[4],address:t[4],port:parseInt(t[5],10),type:t[7]};for(let e=8;e<t.length;e+=2)switch(t[e]){case"raddr":n.relatedAddress=t[e+1];break;case"rport":n.relatedPort=parseInt(t[e+1],10);break;case"tcptype":n.tcpType=t[e+1];break;case"ufrag":n.ufrag=t[e+1],n.usernameFragment=t[e+1];break;default:void 0===n[t[e]]&&(n[t[e]]=t[e+1])}return n},Z.writeCandidate=function(e){let t=[];t.push(e.foundation);let n=e.component;"rtp"===n?t.push(1):"rtcp"===n?t.push(2):t.push(n),t.push(e.protocol.toUpperCase()),t.push(e.priority),t.push(e.address||e.ip),t.push(e.port);let r=e.type;return t.push("typ"),t.push(r),"host"!==r&&e.relatedAddress&&e.relatedPort&&(t.push("raddr"),t.push(e.relatedAddress),t.push("rport"),t.push(e.relatedPort)),e.tcpType&&"tcp"===e.protocol.toLowerCase()&&(t.push("tcptype"),t.push(e.tcpType)),(e.usernameFragment||e.ufrag)&&(t.push("ufrag"),t.push(e.usernameFragment||e.ufrag)),"candidate:"+t.join(" ")},Z.parseIceOptions=function(e){return e.substring(14).split(" ")},Z.parseRtpMap=function(e){let t=e.substring(9).split(" "),n={payloadType:parseInt(t.shift(),10)};return n.name=(t=t[0].split("/"))[0],n.clockRate=parseInt(t[1],10),n.channels=3===t.length?parseInt(t[2],10):1,n.numChannels=n.channels,n},Z.writeRtpMap=function(e){let t=e.payloadType;void 0!==e.preferredPayloadType&&(t=e.preferredPayloadType);let n=e.channels||e.numChannels||1;return"a=rtpmap:"+t+" "+e.name+"/"+e.clockRate+(1!==n?"/"+n:"")+"\r\n"},Z.parseExtmap=function(e){let t=e.substring(9).split(" ");return{id:parseInt(t[0],10),direction:t[0].indexOf("/")>0?t[0].split("/")[1]:"sendrecv",uri:t[1],attributes:t.slice(2).join(" ")}},Z.writeExtmap=function(e){return"a=extmap:"+(e.id||e.preferredId)+(e.direction&&"sendrecv"!==e.direction?"/"+e.direction:"")+" "+e.uri+(e.attributes?" "+e.attributes:"")+"\r\n"},Z.parseFmtp=function(e){let t,n={},r=e.substring(e.indexOf(" ")+1).split(";");for(let e=0;e<r.length;e++)n[(t=r[e].trim().split("="))[0].trim()]=t[1];return n},Z.writeFmtp=function(e){let t="",n=e.payloadType;if(void 0!==e.preferredPayloadType&&(n=e.preferredPayloadType),e.parameters&&Object.keys(e.parameters).length){let r=[];Object.keys(e.parameters).forEach(t=>{void 0!==e.parameters[t]?r.push(t+"="+e.parameters[t]):r.push(t)}),t+="a=fmtp:"+n+" "+r.join(";")+"\r\n"}return t},Z.parseRtcpFb=function(e){let t=e.substring(e.indexOf(" ")+1).split(" ");return{type:t.shift(),parameter:t.join(" ")}},Z.writeRtcpFb=function(e){let t="",n=e.payloadType;return void 0!==e.preferredPayloadType&&(n=e.preferredPayloadType),e.rtcpFeedback&&e.rtcpFeedback.length&&e.rtcpFeedback.forEach(e=>{t+="a=rtcp-fb:"+n+" "+e.type+(e.parameter&&e.parameter.length?" "+e.parameter:"")+"\r\n"}),t},Z.parseSsrcMedia=function(e){let t=e.indexOf(" "),n={ssrc:parseInt(e.substring(7,t),10)},r=e.indexOf(":",t);return r>-1?(n.attribute=e.substring(t+1,r),n.value=e.substring(r+1)):n.attribute=e.substring(t+1),n},Z.parseSsrcGroup=function(e){let t=e.substring(13).split(" ");return{semantics:t.shift(),ssrcs:t.map(e=>parseInt(e,10))}},Z.getMid=function(e){let t=Z.matchPrefix(e,"a=mid:")[0];if(t)return t.substring(6)},Z.parseFingerprint=function(e){let t=e.substring(14).split(" ");return{algorithm:t[0].toLowerCase(),value:t[1].toUpperCase()}},Z.getDtlsParameters=function(e,t){return{role:"auto",fingerprints:Z.matchPrefix(e+t,"a=fingerprint:").map(Z.parseFingerprint)}},Z.writeDtlsParameters=function(e,t){let n="a=setup:"+t+"\r\n";return e.fingerprints.forEach(e=>{n+="a=fingerprint:"+e.algorithm+" "+e.value+"\r\n"}),n},Z.parseCryptoLine=function(e){let t=e.substring(9).split(" ");return{tag:parseInt(t[0],10),cryptoSuite:t[1],keyParams:t[2],sessionParams:t.slice(3)}},Z.writeCryptoLine=function(e){return"a=crypto:"+e.tag+" "+e.cryptoSuite+" "+("object"==typeof e.keyParams?Z.writeCryptoKeyParams(e.keyParams):e.keyParams)+(e.sessionParams?" "+e.sessionParams.join(" "):"")+"\r\n"},Z.parseCryptoKeyParams=function(e){if(0!==e.indexOf("inline:"))return null;let t=e.substring(7).split("|");return{keyMethod:"inline",keySalt:t[0],lifeTime:t[1],mkiValue:t[2]?t[2].split(":")[0]:void 0,mkiLength:t[2]?t[2].split(":")[1]:void 0}},Z.writeCryptoKeyParams=function(e){return e.keyMethod+":"+e.keySalt+(e.lifeTime?"|"+e.lifeTime:"")+(e.mkiValue&&e.mkiLength?"|"+e.mkiValue+":"+e.mkiLength:"")},Z.getCryptoParameters=function(e,t){return Z.matchPrefix(e+t,"a=crypto:").map(Z.parseCryptoLine)},Z.getIceParameters=function(e,t){let n=Z.matchPrefix(e+t,"a=ice-ufrag:")[0],r=Z.matchPrefix(e+t,"a=ice-pwd:")[0];return n&&r?{usernameFragment:n.substring(12),password:r.substring(10)}:null},Z.writeIceParameters=function(e){let t="a=ice-ufrag:"+e.usernameFragment+"\r\na=ice-pwd:"+e.password+"\r\n";return e.iceLite&&(t+="a=ice-lite\r\n"),t},Z.parseRtpParameters=function(e){let t={codecs:[],headerExtensions:[],fecMechanisms:[],rtcp:[]},n=Z.splitLines(e)[0].split(" ");t.profile=n[2];for(let r=3;r<n.length;r++){let i=n[r],s=Z.matchPrefix(e,"a=rtpmap:"+i+" ")[0];if(s){let n=Z.parseRtpMap(s),r=Z.matchPrefix(e,"a=fmtp:"+i+" ");switch(n.parameters=r.length?Z.parseFmtp(r[0]):{},n.rtcpFeedback=Z.matchPrefix(e,"a=rtcp-fb:"+i+" ").map(Z.parseRtcpFb),t.codecs.push(n),n.name.toUpperCase()){case"RED":case"ULPFEC":t.fecMechanisms.push(n.name.toUpperCase())}}}Z.matchPrefix(e,"a=extmap:").forEach(e=>{t.headerExtensions.push(Z.parseExtmap(e))});let r=Z.matchPrefix(e,"a=rtcp-fb:* ").map(Z.parseRtcpFb);return t.codecs.forEach(e=>{r.forEach(t=>{e.rtcpFeedback.find(e=>e.type===t.type&&e.parameter===t.parameter)||e.rtcpFeedback.push(t)})}),t},Z.writeRtpDescription=function(e,t){let n="";n+="m="+e+" ",n+=t.codecs.length>0?"9":"0",n+=" "+(t.profile||"UDP/TLS/RTP/SAVPF")+" ",n+=t.codecs.map(e=>void 0!==e.preferredPayloadType?e.preferredPayloadType:e.payloadType).join(" ")+"\r\n",n+="c=IN IP4 0.0.0.0\r\n",n+="a=rtcp:9 IN IP4 0.0.0.0\r\n",t.codecs.forEach(e=>{n+=Z.writeRtpMap(e),n+=Z.writeFmtp(e),n+=Z.writeRtcpFb(e)});let r=0;return t.codecs.forEach(e=>{e.maxptime>r&&(r=e.maxptime)}),r>0&&(n+="a=maxptime:"+r+"\r\n"),t.headerExtensions&&t.headerExtensions.forEach(e=>{n+=Z.writeExtmap(e)}),n},Z.parseRtpEncodingParameters=function(e){let t,n=[],r=Z.parseRtpParameters(e),i=-1!==r.fecMechanisms.indexOf("RED"),s=-1!==r.fecMechanisms.indexOf("ULPFEC"),o=Z.matchPrefix(e,"a=ssrc:").map(e=>Z.parseSsrcMedia(e)).filter(e=>"cname"===e.attribute),a=o.length>0&&o[0].ssrc,c=Z.matchPrefix(e,"a=ssrc-group:FID").map(e=>e.substring(17).split(" ").map(e=>parseInt(e,10)));c.length>0&&c[0].length>1&&c[0][0]===a&&(t=c[0][1]),r.codecs.forEach(e=>{if("RTX"===e.name.toUpperCase()&&e.parameters.apt){let r={ssrc:a,codecPayloadType:parseInt(e.parameters.apt,10)};a&&t&&(r.rtx={ssrc:t}),n.push(r),i&&((r=JSON.parse(JSON.stringify(r))).fec={ssrc:a,mechanism:s?"red+ulpfec":"red"},n.push(r))}}),0===n.length&&a&&n.push({ssrc:a});let p=Z.matchPrefix(e,"b=");return p.length&&(p=0===p[0].indexOf("b=TIAS:")?parseInt(p[0].substring(7),10):0===p[0].indexOf("b=AS:")?950*parseInt(p[0].substring(5),10)-16e3:void 0,n.forEach(e=>{e.maxBitrate=p})),n},Z.parseRtcpParameters=function(e){let t={},n=Z.matchPrefix(e,"a=ssrc:").map(e=>Z.parseSsrcMedia(e)).filter(e=>"cname"===e.attribute)[0];n&&(t.cname=n.value,t.ssrc=n.ssrc);let r=Z.matchPrefix(e,"a=rtcp-rsize");return t.reducedSize=r.length>0,t.compound=0===r.length,t.mux=Z.matchPrefix(e,"a=rtcp-mux").length>0,t},Z.writeRtcpParameters=function(e){let t="";return e.reducedSize&&(t+="a=rtcp-rsize\r\n"),e.mux&&(t+="a=rtcp-mux\r\n"),void 0!==e.ssrc&&e.cname&&(t+="a=ssrc:"+e.ssrc+" cname:"+e.cname+"\r\n"),t},Z.parseMsid=function(e){let t,n=Z.matchPrefix(e,"a=msid:");if(1===n.length)return{stream:(t=n[0].substring(7).split(" "))[0],track:t[1]};let r=Z.matchPrefix(e,"a=ssrc:").map(e=>Z.parseSsrcMedia(e)).filter(e=>"msid"===e.attribute);if(r.length>0)return{stream:(t=r[0].value.split(" "))[0],track:t[1]}},Z.parseSctpDescription=function(e){let t,n=Z.parseMLine(e),r=Z.matchPrefix(e,"a=max-message-size:");r.length>0&&(t=parseInt(r[0].substring(19),10)),isNaN(t)&&(t=65536);let i=Z.matchPrefix(e,"a=sctp-port:");if(i.length>0)return{port:parseInt(i[0].substring(12),10),protocol:n.fmt,maxMessageSize:t};let s=Z.matchPrefix(e,"a=sctpmap:");if(s.length>0){let e=s[0].substring(10).split(" ");return{port:parseInt(e[0],10),protocol:e[1],maxMessageSize:t}}},Z.writeSctpDescription=function(e,t){let n=[];return n="DTLS/SCTP"!==e.protocol?["m="+e.kind+" 9 "+e.protocol+" "+t.protocol+"\r\n","c=IN IP4 0.0.0.0\r\n","a=sctp-port:"+t.port+"\r\n"]:["m="+e.kind+" 9 "+e.protocol+" "+t.port+"\r\n","c=IN IP4 0.0.0.0\r\n","a=sctpmap:"+t.port+" "+t.protocol+" 65535\r\n"],void 0!==t.maxMessageSize&&n.push("a=max-message-size:"+t.maxMessageSize+"\r\n"),n.join("")},Z.generateSessionId=function(){return Math.random().toString().substr(2,22)},Z.writeSessionBoilerplate=function(e,t,n){return"v=0\r\no="+(n||"thisisadapterortc")+" "+(e||Z.generateSessionId())+" "+(void 0!==t?t:2)+" IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\n"},Z.getDirection=function(e,t){let n=Z.splitLines(e);for(let e=0;e<n.length;e++)switch(n[e]){case"a=sendrecv":case"a=sendonly":case"a=recvonly":case"a=inactive":return n[e].substring(2)}return t?Z.getDirection(t):"sendrecv"},Z.getKind=function(e){return Z.splitLines(e)[0].split(" ")[0].substring(2)},Z.isRejected=function(e){return"0"===e.split(" ",2)[1]},Z.parseMLine=function(e){let t=Z.splitLines(e)[0].substring(2).split(" ");return{kind:t[0],port:parseInt(t[1],10),protocol:t[2],fmt:t.slice(3).join(" ")}},Z.parseOLine=function(e){let t=Z.matchPrefix(e,"o=")[0].substring(2).split(" ");return{username:t[0],sessionId:t[1],sessionVersion:parseInt(t[2],10),netType:t[3],addressType:t[4],address:t[5]}},Z.isValidSDP=function(e){if("string"!=typeof e||0===e.length)return!1;let t=Z.splitLines(e);for(let e=0;e<t.length;e++)if(t[e].length<2||"="!==t[e].charAt(1))return!1;return!0},q=Z;let ec=function({window:e}={},t={shimChrome:!0,shimFirefox:!0,shimSafari:!0}){let n=function(e){let t={browser:null,version:null};if(void 0===e||!e.navigator||!e.navigator.userAgent)return t.browser="Not a browser.",t;let{navigator:n}=e;if(n.userAgentData&&n.userAgentData.brands){let e=n.userAgentData.brands.find(e=>"Chromium"===e.brand);if(e)return{browser:"chrome",version:parseInt(e.version,10)}}return n.mozGetUserMedia?(t.browser="firefox",t.version=d(n.userAgent,/Firefox\/(\d+)\./,1)):n.webkitGetUserMedia||!1===e.isSecureContext&&e.webkitRTCPeerConnection?(t.browser="chrome",t.version=d(n.userAgent,/Chrom(e|ium)\/(\d+)\./,2)):e.RTCPeerConnection&&n.userAgent.match(/AppleWebKit\/(\d+)\./)?(t.browser="safari",t.version=d(n.userAgent,/AppleWebKit\/(\d+)\./,1),t.supportsUnifiedPlan=e.RTCRtpTransceiver&&"currentDirection"in e.RTCRtpTransceiver.prototype):t.browser="Not a supported browser.",t}(e),r={browserDetails:n,commonShim:Q,extractVersion:d,disableLog:h,disableWarnings:u,sdp:q};switch(n.browser){case"chrome":if(!y||!y.shimPeerConnection||!t.shimChrome){f("Chrome shim is not included in this adapter release.");break}if(null===n.version){f("Chrome shim can not determine version, not shimming.");break}f("adapter.js shimming chrome."),r.browserShim=y,eo(e,n),ea(e,n),y.shimGetUserMedia(e,n),y.shimMediaStream(e,n),y.shimPeerConnection(e,n),y.shimOnTrack(e,n),y.shimAddTrackRemoveTrack(e,n),y.shimGetSendersWithDtmf(e,n),y.shimSenderReceiverGetStats(e,n),y.fixNegotiationNeeded(e,n),ee(e,n),et(e,n),ei(e,n),en(e,n),er(e,n),es(e,n);break;case"firefox":if(!E||!E.shimPeerConnection||!t.shimFirefox){f("Firefox shim is not included in this adapter release.");break}f("adapter.js shimming firefox."),r.browserShim=E,eo(e,n),ea(e,n),E.shimGetUserMedia(e,n),E.shimPeerConnection(e,n),E.shimOnTrack(e,n),E.shimRemoveStream(e,n),E.shimSenderGetStats(e,n),E.shimReceiverGetStats(e,n),E.shimRTCDataChannel(e,n),E.shimAddTransceiver(e,n),E.shimGetParameters(e,n),E.shimCreateOffer(e,n),E.shimCreateAnswer(e,n),ee(e,n),ei(e,n),en(e,n),er(e,n);break;case"safari":if(!z||!t.shimSafari){f("Safari shim is not included in this adapter release.");break}f("adapter.js shimming safari."),r.browserShim=z,eo(e,n),ea(e,n),z.shimRTCIceServerUrls(e,n),z.shimCreateOfferLegacy(e,n),z.shimCallbacksAPI(e,n),z.shimLocalStreamsAPI(e,n),z.shimRemoteStreamsAPI(e,n),z.shimTrackEventTransceiver(e,n),z.shimGetUserMedia(e,n),z.shimAudioContext(e,n),ee(e,n),et(e,n),en(e,n),er(e,n),es(e,n);break;default:f("Unsupported browser!")}return r}({window:"undefined"==typeof window?void 0:window}),ep=ec.default||ec,ed=new class{isWebRTCSupported(){return"undefined"!=typeof RTCPeerConnection}isBrowserSupported(){let e=this.getBrowser(),t=this.getVersion();return!!this.supportedBrowsers.includes(e)&&("chrome"===e?t>=this.minChromeVersion:"firefox"===e?t>=this.minFirefoxVersion:"safari"===e&&!this.isIOS&&t>=this.minSafariVersion)}getBrowser(){return ep.browserDetails.browser}getVersion(){return ep.browserDetails.version||0}isUnifiedPlanSupported(){let e,t=this.getBrowser(),n=ep.browserDetails.version||0;if("chrome"===t&&n<this.minChromeVersion)return!1;if("firefox"===t&&n>=this.minFirefoxVersion)return!0;if(!window.RTCRtpTransceiver||!("currentDirection"in RTCRtpTransceiver.prototype))return!1;let r=!1;try{(e=new RTCPeerConnection).addTransceiver("audio"),r=!0}catch(e){}finally{e&&e.close()}return r}toString(){return`Supports:
+    browser:${this.getBrowser()}
+    version:${this.getVersion()}
+    isIOS:${this.isIOS}
+    isWebRTCSupported:${this.isWebRTCSupported()}
+    isBrowserSupported:${this.isBrowserSupported()}
+    isUnifiedPlanSupported:${this.isUnifiedPlanSupported()}`}constructor(){this.isIOS="undefined"!=typeof navigator&&["iPad","iPhone","iPod"].includes(navigator.platform),this.supportedBrowsers=["firefox","chrome","safari"],this.minFirefoxVersion=59,this.minChromeVersion=72,this.minSafariVersion=605}},el=e=>!e||/^[A-Za-z0-9]+(?:[ _-][A-Za-z0-9]+)*$/.test(e),eh=()=>Math.random().toString(36).slice(2),eu={iceServers:[{urls:"stun:stun.l.google.com:19302"},{urls:["turn:eu-0.turn.peerjs.com:3478","turn:us-0.turn.peerjs.com:3478"],username:"peerjs",credential:"peerjsp"}],sdpSemantics:"unified-plan"},ef=new class extends n{noop(){}blobToArrayBuffer(e,t){let n=new FileReader;return n.onload=function(e){e.target&&t(e.target.result)},n.readAsArrayBuffer(e),n}binaryStringToArrayBuffer(e){let t=new Uint8Array(e.length);for(let n=0;n<e.length;n++)t[n]=255&e.charCodeAt(n);return t.buffer}isSecure(){return"https:"===location.protocol}constructor(...e){super(...e),this.CLOUD_HOST="0.peerjs.com",this.CLOUD_PORT=443,this.chunkedBrowsers={Chrome:1,chrome:1},this.defaultConfig=eu,this.browser=ed.getBrowser(),this.browserVersion=ed.getVersion(),this.pack=s,this.unpack=i,this.supports=function(){let e,t={browser:ed.isBrowserSupported(),webRTC:ed.isWebRTCSupported(),audioVideo:!1,data:!1,binaryBlob:!1,reliable:!1};if(!t.webRTC)return t;try{let n;e=new RTCPeerConnection(eu),t.audioVideo=!0;try{n=e.createDataChannel("_PEERJSTEST",{ordered:!0}),t.data=!0,t.reliable=!!n.ordered;try{n.binaryType="blob",t.binaryBlob=!ed.isIOS}catch(e){}}catch(e){}finally{n&&n.close()}}catch(e){}finally{e&&e.close()}return t}(),this.validateId=el,this.randomToken=eh}};"use strict";var em=new class{get logLevel(){return this._logLevel}set logLevel(e){this._logLevel=e}log(...e){this._logLevel>=3&&this._print(3,...e)}warn(...e){this._logLevel>=2&&this._print(2,...e)}error(...e){this._logLevel>=1&&this._print(1,...e)}setLogFunction(e){this._print=e}_print(e,...t){let n=["PeerJS: ",...t];for(let e in n)n[e]instanceof Error&&(n[e]="("+n[e].name+") "+n[e].message);e>=3?console.log(...n):e>=2?console.warn("WARNING",...n):e>=1&&console.error("ERROR",...n)}constructor(){this._logLevel=0}},e_={},eg=Object.prototype.hasOwnProperty,ey="~";function eC(){}function ev(e,t,n){this.fn=e,this.context=t,this.once=n||!1}function eb(e,t,n,r,i){if("function"!=typeof n)throw TypeError("The listener must be a function");var s=new ev(n,r||e,i),o=ey?ey+t:t;return e._events[o]?e._events[o].fn?e._events[o]=[e._events[o],s]:e._events[o].push(s):(e._events[o]=s,e._eventsCount++),e}function eT(e,t){0==--e._eventsCount?e._events=new eC:delete e._events[t]}function eS(){this._events=new eC,this._eventsCount=0}Object.create&&(eC.prototype=Object.create(null),new eC().__proto__||(ey=!1)),eS.prototype.eventNames=function(){var e,t,n=[];if(0===this._eventsCount)return n;for(t in e=this._events)eg.call(e,t)&&n.push(ey?t.slice(1):t);return Object.getOwnPropertySymbols?n.concat(Object.getOwnPropertySymbols(e)):n},eS.prototype.listeners=function(e){var t=ey?ey+e:e,n=this._events[t];if(!n)return[];if(n.fn)return[n.fn];for(var r=0,i=n.length,s=Array(i);r<i;r++)s[r]=n[r].fn;return s},eS.prototype.listenerCount=function(e){var t=ey?ey+e:e,n=this._events[t];return n?n.fn?1:n.length:0},eS.prototype.emit=function(e,t,n,r,i,s){var o=ey?ey+e:e;if(!this._events[o])return!1;var a,c,p=this._events[o],d=arguments.length;if(p.fn){switch(p.once&&this.removeListener(e,p.fn,void 0,!0),d){case 1:return p.fn.call(p.context),!0;case 2:return p.fn.call(p.context,t),!0;case 3:return p.fn.call(p.context,t,n),!0;case 4:return p.fn.call(p.context,t,n,r),!0;case 5:return p.fn.call(p.context,t,n,r,i),!0;case 6:return p.fn.call(p.context,t,n,r,i,s),!0}for(c=1,a=Array(d-1);c<d;c++)a[c-1]=arguments[c];p.fn.apply(p.context,a)}else{var l,h=p.length;for(c=0;c<h;c++)switch(p[c].once&&this.removeListener(e,p[c].fn,void 0,!0),d){case 1:p[c].fn.call(p[c].context);break;case 2:p[c].fn.call(p[c].context,t);break;case 3:p[c].fn.call(p[c].context,t,n);break;case 4:p[c].fn.call(p[c].context,t,n,r);break;default:if(!a)for(l=1,a=Array(d-1);l<d;l++)a[l-1]=arguments[l];p[c].fn.apply(p[c].context,a)}}return!0},eS.prototype.on=function(e,t,n){return eb(this,e,t,n,!1)},eS.prototype.once=function(e,t,n){return eb(this,e,t,n,!0)},eS.prototype.removeListener=function(e,t,n,r){var i=ey?ey+e:e;if(!this._events[i])return this;if(!t)return eT(this,i),this;var s=this._events[i];if(s.fn)s.fn!==t||r&&!s.once||n&&s.context!==n||eT(this,i);else{for(var o=0,a=[],c=s.length;o<c;o++)(s[o].fn!==t||r&&!s[o].once||n&&s[o].context!==n)&&a.push(s[o]);a.length?this._events[i]=1===a.length?a[0]:a:eT(this,i)}return this},eS.prototype.removeAllListeners=function(e){var t;return e?(t=ey?ey+e:e,this._events[t]&&eT(this,t)):(this._events=new eC,this._eventsCount=0),this},eS.prototype.off=eS.prototype.removeListener,eS.prototype.addListener=eS.prototype.on,eS.prefixed=ey,eS.EventEmitter=eS,e_=eS;var ek=function(e){return e.Data="data",e.Media="media",e}({}),eR=function(e){return e.BrowserIncompatible="browser-incompatible",e.Disconnected="disconnected",e.InvalidID="invalid-id",e.InvalidKey="invalid-key",e.Network="network",e.PeerUnavailable="peer-unavailable",e.SslUnavailable="ssl-unavailable",e.ServerError="server-error",e.SocketError="socket-error",e.SocketClosed="socket-closed",e.UnavailableID="unavailable-id",e.WebRTC="webrtc",e}({}),eP=function(e){return e.NegotiationFailed="negotiation-failed",e.ConnectionClosed="connection-closed",e}({}),ew=function(e){return e.NotOpenYet="not-open-yet",e.MessageToBig="message-too-big",e}({}),eE=function(e){return e.Binary="binary",e.BinaryUTF8="binary-utf8",e.JSON="json",e.None="raw",e}({}),ex=function(e){return e.Message="message",e.Disconnected="disconnected",e.Error="error",e.Close="close",e}({}),eD=function(e){return e.Heartbeat="HEARTBEAT",e.Candidate="CANDIDATE",e.Offer="OFFER",e.Answer="ANSWER",e.Open="OPEN",e.Error="ERROR",e.IdTaken="ID-TAKEN",e.InvalidKey="INVALID-KEY",e.Leave="LEAVE",e.Expire="EXPIRE",e}({});let eI="1.5.5";class eM extends e_.EventEmitter{start(e,t){this._id=e;let n=`${this._baseUrl}&id=${e}&token=${t}`;!this._socket&&this._disconnected&&(this._socket=new WebSocket(n+"&version="+eI),this._disconnected=!1,this._socket.onmessage=e=>{let t;try{t=JSON.parse(e.data),em.log("Server message received:",t)}catch(t){em.log("Invalid server message",e.data);return}this.emit(ex.Message,t)},this._socket.onclose=e=>{this._disconnected||(em.log("Socket closed.",e),this._cleanup(),this._disconnected=!0,this.emit(ex.Disconnected))},this._socket.onopen=()=>{this._disconnected||(this._sendQueuedMessages(),em.log("Socket open"),this._scheduleHeartbeat())})}_scheduleHeartbeat(){this._wsPingTimer=setTimeout(()=>{this._sendHeartbeat()},this.pingInterval)}_sendHeartbeat(){if(!this._wsOpen())return void em.log("Cannot send heartbeat, because socket closed");let e=JSON.stringify({type:eD.Heartbeat});this._socket.send(e),this._scheduleHeartbeat()}_wsOpen(){return!!this._socket&&1===this._socket.readyState}_sendQueuedMessages(){let e=[...this._messagesQueue];for(let t of(this._messagesQueue=[],e))this.send(t)}send(e){if(this._disconnected)return;if(!this._id)return void this._messagesQueue.push(e);if(!e.type)return void this.emit(ex.Error,"Invalid message");if(!this._wsOpen())return;let t=JSON.stringify(e);this._socket.send(t)}close(){this._disconnected||(this._cleanup(),this._disconnected=!0)}_cleanup(){this._socket&&(this._socket.onopen=this._socket.onmessage=this._socket.onclose=null,this._socket.close(),this._socket=void 0),clearTimeout(this._wsPingTimer)}constructor(e,t,n,r,i,s=5e3){super(),this.pingInterval=s,this._disconnected=!0,this._messagesQueue=[],this._baseUrl=(e?"wss://":"ws://")+t+":"+n+r+"peerjs?key="+i}}class eO{startConnection(e){let t=this._startPeerConnection();if(this.connection.peerConnection=t,this.connection.type===ek.Media&&e._stream&&this._addTracksToConnection(e._stream,t),e.originator){let n=this.connection,r={ordered:!!e.reliable},i=t.createDataChannel(n.label,r);n._initializeDataChannel(i),this._makeOffer()}else this.handleSDP("OFFER",e.sdp)}_startPeerConnection(){em.log("Creating RTCPeerConnection.");let e=new RTCPeerConnection(this.connection.provider.options.config);return this._setupListeners(e),e}_setupListeners(e){let t=this.connection.peer,n=this.connection.connectionId,r=this.connection.type,i=this.connection.provider;em.log("Listening for ICE candidates."),e.onicecandidate=e=>{e.candidate&&e.candidate.candidate&&(em.log(`Received ICE candidates for ${t}:`,e.candidate),i.socket.send({type:eD.Candidate,payload:{candidate:e.candidate,type:r,connectionId:n},dst:t}))},e.oniceconnectionstatechange=()=>{switch(e.iceConnectionState){case"failed":em.log("iceConnectionState is failed, closing connections to "+t),this.connection.emitError(eP.NegotiationFailed,"Negotiation of connection to "+t+" failed."),this.connection.close();break;case"closed":em.log("iceConnectionState is closed, closing connections to "+t),this.connection.emitError(eP.ConnectionClosed,"Connection to "+t+" closed."),this.connection.close();break;case"disconnected":em.log("iceConnectionState changed to disconnected on the connection with "+t);break;case"completed":e.onicecandidate=()=>{}}this.connection.emit("iceStateChanged",e.iceConnectionState)},em.log("Listening for data channel"),e.ondatachannel=e=>{em.log("Received data channel");let r=e.channel;i.getConnection(t,n)._initializeDataChannel(r)},em.log("Listening for remote stream"),e.ontrack=e=>{em.log("Received remote stream");let r=e.streams[0],s=i.getConnection(t,n);s.type===ek.Media&&this._addStreamToMediaConnection(r,s)}}cleanup(){em.log("Cleaning up PeerConnection to "+this.connection.peer);let e=this.connection.peerConnection;if(!e)return;this.connection.peerConnection=null,e.onicecandidate=e.oniceconnectionstatechange=e.ondatachannel=e.ontrack=()=>{};let t="closed"!==e.signalingState,n=!1,r=this.connection.dataChannel;r&&(n=!!r.readyState&&"closed"!==r.readyState),(t||n)&&e.close()}async _makeOffer(){let e=this.connection.peerConnection,t=this.connection.provider;try{let n=await e.createOffer(this.connection.options.constraints);em.log("Created offer."),this.connection.options.sdpTransform&&"function"==typeof this.connection.options.sdpTransform&&(n.sdp=this.connection.options.sdpTransform(n.sdp)||n.sdp);try{await e.setLocalDescription(n),em.log("Set localDescription:",n,`for:${this.connection.peer}`);let r={sdp:n,type:this.connection.type,connectionId:this.connection.connectionId,metadata:this.connection.metadata};if(this.connection.type===ek.Data){let e=this.connection;r={...r,label:e.label,reliable:e.reliable,serialization:e.serialization}}t.socket.send({type:eD.Offer,payload:r,dst:this.connection.peer})}catch(e){"OperationError: Failed to set local offer sdp: Called in wrong state: kHaveRemoteOffer"!=e&&(t.emitError(eR.WebRTC,e),em.log("Failed to setLocalDescription, ",e))}}catch(e){t.emitError(eR.WebRTC,e),em.log("Failed to createOffer, ",e)}}async _makeAnswer(){let e=this.connection.peerConnection,t=this.connection.provider;try{let n=await e.createAnswer();em.log("Created answer."),this.connection.options.sdpTransform&&"function"==typeof this.connection.options.sdpTransform&&(n.sdp=this.connection.options.sdpTransform(n.sdp)||n.sdp);try{await e.setLocalDescription(n),em.log("Set localDescription:",n,`for:${this.connection.peer}`),t.socket.send({type:eD.Answer,payload:{sdp:n,type:this.connection.type,connectionId:this.connection.connectionId},dst:this.connection.peer})}catch(e){t.emitError(eR.WebRTC,e),em.log("Failed to setLocalDescription, ",e)}}catch(e){t.emitError(eR.WebRTC,e),em.log("Failed to create answer, ",e)}}async handleSDP(e,t){t=new RTCSessionDescription(t);let n=this.connection.peerConnection,r=this.connection.provider;em.log("Setting remote description",t);try{await n.setRemoteDescription(t),em.log(`Set remoteDescription:${e} for:${this.connection.peer}`),"OFFER"===e&&await this._makeAnswer()}catch(e){r.emitError(eR.WebRTC,e),em.log("Failed to setRemoteDescription, ",e)}}async handleCandidate(e){em.log("handleCandidate:",e);try{await this.connection.peerConnection.addIceCandidate(e),em.log(`Added ICE candidate for:${this.connection.peer}`)}catch(e){this.connection.provider.emitError(eR.WebRTC,e),em.log("Failed to handleCandidate, ",e)}}_addTracksToConnection(e,t){if(em.log(`add tracks from stream ${e.id} to peer connection`),!t.addTrack)return em.error("Your browser does't support RTCPeerConnection#addTrack. Ignored.");e.getTracks().forEach(n=>{t.addTrack(n,e)})}_addStreamToMediaConnection(e,t){em.log(`add stream ${e.id} to media connection ${t.connectionId}`),t.addStream(e)}constructor(e){this.connection=e}}class eL extends e_.EventEmitter{emitError(e,t){em.error("Error:",t),this.emit("error",new eA(`${e}`,t))}}class eA extends Error{constructor(e,t){"string"==typeof t?super(t):(super(),Object.assign(this,t)),this.type=e}}class ej extends eL{get open(){return this._open}constructor(e,t,n){super(),this.peer=e,this.provider=t,this.options=n,this._open=!1,this.metadata=n.metadata}}class eB extends ej{get type(){return ek.Media}get localStream(){return this._localStream}get remoteStream(){return this._remoteStream}_initializeDataChannel(e){this.dataChannel=e,this.dataChannel.onopen=()=>{em.log(`DC#${this.connectionId} dc connection success`),this.emit("willCloseOnRemote")},this.dataChannel.onclose=()=>{em.log(`DC#${this.connectionId} dc closed for:`,this.peer),this.close()}}addStream(e){em.log("Receiving stream",e),this._remoteStream=e,super.emit("stream",e)}handleMessage(e){let t=e.type,n=e.payload;switch(e.type){case eD.Answer:this._negotiator.handleSDP(t,n.sdp),this._open=!0;break;case eD.Candidate:this._negotiator.handleCandidate(n.candidate);break;default:em.warn(`Unrecognized message type:${t} from peer:${this.peer}`)}}answer(e,t={}){if(this._localStream)return void em.warn("Local stream already exists on this MediaConnection. Are you answering a call twice?");for(let n of(this._localStream=e,t&&t.sdpTransform&&(this.options.sdpTransform=t.sdpTransform),this._negotiator.startConnection({...this.options._payload,_stream:e}),this.provider._getMessages(this.connectionId)))this.handleMessage(n);this._open=!0}close(){this._negotiator&&(this._negotiator.cleanup(),this._negotiator=null),this._localStream=null,this._remoteStream=null,this.provider&&(this.provider._removeConnection(this),this.provider=null),this.options&&this.options._stream&&(this.options._stream=null),this.open&&(this._open=!1,super.emit("close"))}constructor(e,t,n){super(e,t,n),this._localStream=this.options._stream,this.connectionId=this.options.connectionId||eB.ID_PREFIX+ef.randomToken(),this._negotiator=new eO(this),this._localStream&&this._negotiator.startConnection({_stream:this._localStream,originator:!0})}}eB.ID_PREFIX="mc_";class eU{_buildRequest(e){let t=this._options.secure?"https":"http",{host:n,port:r,path:i,key:s}=this._options,o=new URL(`${t}://${n}:${r}${i}${s}/${e}`);return o.searchParams.set("ts",`${Date.now()}${Math.random()}`),o.searchParams.set("version",eI),fetch(o.href,{referrerPolicy:this._options.referrerPolicy})}async retrieveId(){try{let e=await this._buildRequest("id");if(200!==e.status)throw Error(`Error. Status:${e.status}`);return e.text()}catch(t){em.error("Error retrieving ID",t);let e="";throw"/"===this._options.path&&this._options.host!==ef.CLOUD_HOST&&(e=" If you passed in a `path` to your self-hosted PeerServer, you'll also need to pass in that same path when creating a new Peer."),Error("Could not get an ID from the server."+e)}}async listAllPeers(){try{let e=await this._buildRequest("peers");if(200!==e.status){if(401===e.status){let e="";throw e=this._options.host===ef.CLOUD_HOST?"It looks like you're using the cloud server. You can email team@peerjs.com to enable peer listing for your API key.":"You need to enable `allow_discovery` on your self-hosted PeerServer to use this feature.",Error("It doesn't look like you have permission to list peers IDs. "+e)}throw Error(`Error. Status:${e.status}`)}return e.json()}catch(e){throw em.error("Error retrieving list peers",e),Error("Could not get list peers from the server."+e)}}constructor(e){this._options=e}}class eF extends ej{get type(){return ek.Data}_initializeDataChannel(e){this.dataChannel=e,this.dataChannel.onopen=()=>{em.log(`DC#${this.connectionId} dc connection success`),this._open=!0,this.emit("open")},this.dataChannel.onmessage=e=>{em.log(`DC#${this.connectionId} dc onmessage:`,e.data)},this.dataChannel.onclose=()=>{em.log(`DC#${this.connectionId} dc closed for:`,this.peer),this.close()}}close(e){if(e?.flush)return void this.send({__peerData:{type:"close"}});this._negotiator&&(this._negotiator.cleanup(),this._negotiator=null),this.provider&&(this.provider._removeConnection(this),this.provider=null),this.dataChannel&&(this.dataChannel.onopen=null,this.dataChannel.onmessage=null,this.dataChannel.onclose=null,this.dataChannel=null),this.open&&(this._open=!1,super.emit("close"))}send(e,t=!1){return this.open?this._send(e,t):void this.emitError(ew.NotOpenYet,"Connection is not open. You should listen for the `open` event before sending messages.")}async handleMessage(e){let t=e.payload;switch(e.type){case eD.Answer:await this._negotiator.handleSDP(e.type,t.sdp);break;case eD.Candidate:await this._negotiator.handleCandidate(t.candidate);break;default:em.warn("Unrecognized message type:",e.type,"from peer:",this.peer)}}constructor(e,t,n){super(e,t,n),this.connectionId=this.options.connectionId||eF.ID_PREFIX+eh(),this.label=this.options.label||this.connectionId,this.reliable=!!this.options.reliable,this._negotiator=new eO(this),this._negotiator.startConnection(this.options._payload||{originator:!0,reliable:this.reliable})}}eF.ID_PREFIX="dc_",eF.MAX_BUFFERED_AMOUNT=8388608;class eN extends eF{get bufferSize(){return this._bufferSize}_initializeDataChannel(e){super._initializeDataChannel(e),this.dataChannel.binaryType="arraybuffer",this.dataChannel.addEventListener("message",e=>this._handleDataMessage(e))}_bufferedSend(e){(this._buffering||!this._trySend(e))&&(this._buffer.push(e),this._bufferSize=this._buffer.length)}_trySend(e){if(!this.open)return!1;if(this.dataChannel.bufferedAmount>eF.MAX_BUFFERED_AMOUNT)return this._buffering=!0,setTimeout(()=>{this._buffering=!1,this._tryBuffer()},50),!1;try{this.dataChannel.send(e)}catch(e){return em.error(`DC#:${this.connectionId} Error when sending:`,e),this._buffering=!0,this.close(),!1}return!0}_tryBuffer(){if(!this.open||0===this._buffer.length)return;let e=this._buffer[0];this._trySend(e)&&(this._buffer.shift(),this._bufferSize=this._buffer.length,this._tryBuffer())}close(e){if(e?.flush)return void this.send({__peerData:{type:"close"}});this._buffer=[],this._bufferSize=0,super.close()}constructor(...e){super(...e),this._buffer=[],this._bufferSize=0,this._buffering=!1}}class ez extends eN{close(e){super.close(e),this._chunkedData={}}_handleDataMessage({data:e}){let t=i(e),n=t.__peerData;if(n)return"close"===n.type?void this.close():void this._handleChunk(t);this.emit("data",t)}_handleChunk(e){let t=e.__peerData,n=this._chunkedData[t]||{data:[],count:0,total:e.total};if(n.data[e.n]=new Uint8Array(e.data),n.count++,this._chunkedData[t]=n,n.total===n.count){delete this._chunkedData[t];let e=function(e){let t=0;for(let n of e)t+=n.byteLength;let n=new Uint8Array(t),r=0;for(let t of e)n.set(t,r),r+=t.byteLength;return n}(n.data);this._handleDataMessage({data:e})}}_send(e,t){let n=s(e);return n instanceof Promise?this._send_blob(n):!t&&n.byteLength>this.chunker.chunkedMTU?void this._sendChunks(n):void this._bufferedSend(n)}async _send_blob(e){let t=await e;if(t.byteLength>this.chunker.chunkedMTU)return void this._sendChunks(t);this._bufferedSend(t)}_sendChunks(e){let t=this.chunker.chunk(e);for(let e of(em.log(`DC#${this.connectionId} Try to send ${t.length} chunks...`),t))this.send(e,!0)}constructor(e,t,r){super(e,t,r),this.chunker=new n,this.serialization=eE.Binary,this._chunkedData={}}}class e$ extends eN{_handleDataMessage({data:e}){super.emit("data",e)}_send(e,t){this._bufferedSend(e)}constructor(...e){super(...e),this.serialization=eE.None}}class eV extends eN{_handleDataMessage({data:e}){let t=this.parse(this.decoder.decode(e)),n=t.__peerData;if(n&&"close"===n.type)return void this.close();this.emit("data",t)}_send(e,t){let n=this.encoder.encode(this.stringify(e));if(n.byteLength>=ef.chunkedMTU)return void this.emitError(ew.MessageToBig,"Message too big for JSON channel");this._bufferedSend(n)}constructor(...e){super(...e),this.serialization=eE.JSON,this.encoder=new TextEncoder,this.decoder=new TextDecoder,this.stringify=JSON.stringify,this.parse=JSON.parse}}class eG extends eL{get id(){return this._id}get options(){return this._options}get open(){return this._open}get socket(){return this._socket}get connections(){let e=Object.create(null);for(let[t,n]of this._connections)e[t]=n;return e}get destroyed(){return this._destroyed}get disconnected(){return this._disconnected}_createServerConnection(){let e=new eM(this._options.secure,this._options.host,this._options.port,this._options.path,this._options.key,this._options.pingInterval);return e.on(ex.Message,e=>{this._handleMessage(e)}),e.on(ex.Error,e=>{this._abort(eR.SocketError,e)}),e.on(ex.Disconnected,()=>{this.disconnected||(this.emitError(eR.Network,"Lost connection to server."),this.disconnect())}),e.on(ex.Close,()=>{this.disconnected||this._abort(eR.SocketClosed,"Underlying socket is already closed.")}),e}_initialize(e){this._id=e,this.socket.start(e,this._options.token)}_handleMessage(e){let t=e.type,n=e.payload,r=e.src;switch(t){case eD.Open:this._lastServerId=this.id,this._open=!0,this.emit("open",this.id);break;case eD.Error:this._abort(eR.ServerError,n.msg);break;case eD.IdTaken:this._abort(eR.UnavailableID,`ID "${this.id}" is taken`);break;case eD.InvalidKey:this._abort(eR.InvalidKey,`API KEY "${this._options.key}" is invalid`);break;case eD.Leave:em.log(`Received leave message from ${r}`),this._cleanupPeer(r),this._connections.delete(r);break;case eD.Expire:this.emitError(eR.PeerUnavailable,`Could not connect to peer ${r}`);break;case eD.Offer:{let e=n.connectionId,t=this.getConnection(r,e);if(t&&(t.close(),em.warn(`Offer received for existing Connection ID:${e}`)),n.type===ek.Media){let i=new eB(r,this,{connectionId:e,_payload:n,metadata:n.metadata});t=i,this._addConnection(r,t),this.emit("call",i)}else{if(n.type!==ek.Data)return void em.warn(`Received malformed connection type:${n.type}`);let i=new this._serializers[n.serialization](r,this,{connectionId:e,_payload:n,metadata:n.metadata,label:n.label,serialization:n.serialization,reliable:n.reliable});t=i,this._addConnection(r,t),this.emit("connection",i)}for(let n of this._getMessages(e))t.handleMessage(n);break}default:{if(!n)return void em.warn(`You received a malformed message from ${r} of type ${t}`);let i=n.connectionId,s=this.getConnection(r,i);s&&s.peerConnection?s.handleMessage(e):i?this._storeMessage(i,e):em.warn("You received an unrecognized message:",e)}}}_storeMessage(e,t){this._lostMessages.has(e)||this._lostMessages.set(e,[]),this._lostMessages.get(e).push(t)}_getMessages(e){let t=this._lostMessages.get(e);return t?(this._lostMessages.delete(e),t):[]}connect(e,t={}){if(t={serialization:"default",...t},this.disconnected){em.warn("You cannot connect to a new Peer because you called .disconnect() on this Peer and ended your connection with the server. You can create a new Peer to reconnect, or call reconnect on this peer if you believe its ID to still be available."),this.emitError(eR.Disconnected,"Cannot connect to new Peer after disconnecting from server.");return}let n=new this._serializers[t.serialization](e,this,t);return this._addConnection(e,n),n}call(e,t,n={}){if(this.disconnected){em.warn("You cannot connect to a new Peer because you called .disconnect() on this Peer and ended your connection with the server. You can create a new Peer to reconnect."),this.emitError(eR.Disconnected,"Cannot connect to new Peer after disconnecting from server.");return}if(!t)return void em.error("To call a peer, you must provide a stream from your browser's `getUserMedia`.");let r=new eB(e,this,{...n,_stream:t});return this._addConnection(e,r),r}_addConnection(e,t){em.log(`add connection ${t.type}:${t.connectionId} to peerId:${e}`),this._connections.has(e)||this._connections.set(e,[]),this._connections.get(e).push(t)}_removeConnection(e){let t=this._connections.get(e.peer);if(t){let n=t.indexOf(e);-1!==n&&t.splice(n,1)}this._lostMessages.delete(e.connectionId)}getConnection(e,t){let n=this._connections.get(e);if(!n)return null;for(let e of n)if(e.connectionId===t)return e;return null}_delayedAbort(e,t){setTimeout(()=>{this._abort(e,t)},0)}_abort(e,t){em.error("Aborting!"),this.emitError(e,t),this._lastServerId?this.disconnect():this.destroy()}destroy(){this.destroyed||(em.log(`Destroy peer with ID:${this.id}`),this.disconnect(),this._cleanup(),this._destroyed=!0,this.emit("close"))}_cleanup(){for(let e of this._connections.keys())this._cleanupPeer(e),this._connections.delete(e);this.socket.removeAllListeners()}_cleanupPeer(e){let t=this._connections.get(e);if(t)for(let e of t)e.close()}disconnect(){if(this.disconnected)return;let e=this.id;em.log(`Disconnect peer with ID:${e}`),this._disconnected=!0,this._open=!1,this.socket.close(),this._lastServerId=e,this._id=null,this.emit("disconnected",e)}reconnect(){if(this.disconnected&&!this.destroyed)em.log(`Attempting reconnection to server with ID ${this._lastServerId}`),this._disconnected=!1,this._initialize(this._lastServerId);else if(this.destroyed)throw Error("This peer cannot reconnect to the server. It has already been destroyed.");else if(this.disconnected||this.open)throw Error(`Peer ${this.id} cannot reconnect because it is not disconnected from the server!`);else em.error("In a hurry? We're still trying to make the initial connection!")}listAllPeers(e=e=>{}){this._api.listAllPeers().then(t=>e(t)).catch(e=>this._abort(eR.ServerError,e))}constructor(e,t){let n;if(super(),this._serializers={raw:e$,json:eV,binary:ez,"binary-utf8":ez,default:ez},this._id=null,this._lastServerId=null,this._destroyed=!1,this._disconnected=!1,this._open=!1,this._connections=new Map,this._lostMessages=new Map,e&&e.constructor==Object?t=e:e&&(n=e.toString()),t={debug:0,host:ef.CLOUD_HOST,port:ef.CLOUD_PORT,path:"/",key:eG.DEFAULT_KEY,token:ef.randomToken(),config:ef.defaultConfig,referrerPolicy:"strict-origin-when-cross-origin",serializers:{},...t},this._options=t,this._serializers={...this._serializers,...this.options.serializers},"/"===this._options.host&&(this._options.host=window.location.hostname),this._options.path&&("/"!==this._options.path[0]&&(this._options.path="/"+this._options.path),"/"!==this._options.path[this._options.path.length-1]&&(this._options.path+="/")),void 0===this._options.secure&&this._options.host!==ef.CLOUD_HOST?this._options.secure=ef.isSecure():this._options.host==ef.CLOUD_HOST&&(this._options.secure=!0),this._options.logFunction&&em.setLogFunction(this._options.logFunction),em.logLevel=this._options.debug||0,this._api=new eU(t),this._socket=this._createServerConnection(),!ef.supports.audioVideo&&!ef.supports.data)return void this._delayedAbort(eR.BrowserIncompatible,"The current browser does not support WebRTC");if(n&&!ef.validateId(n))return void this._delayedAbort(eR.InvalidID,`ID "${n}" is invalid`);n?this._initialize(n):this._api.retrieveId().then(e=>this._initialize(e)).catch(e=>this._abort(eR.ServerError,e))}}eG.DEFAULT_KEY="peerjs",window.peerjs={Peer:eG,util:ef},window.Peer=eG})();
+//# sourceMappingURL=peerjs.min.js.map
+</script>
+<style>
+:root{--bg:#06121f;--pan:#0f2236;--line:#1f3a57;--tx:#eaf2fb;--mut:#8ea6bf;--acc:#ffb020;--red:#ff4d4d;--grn:#36d399;--sea1:#0b3a66;--sea2:#0e4b80}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html,body{margin:0;height:100%;background:radial-gradient(ellipse at top,#0c2742,#06121f 70%);color:var(--tx);font:15px/1.35 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;-webkit-user-select:none;user-select:none;overflow:hidden}
+body{padding:env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left)}
+button{font:inherit;color:inherit;border:1px solid var(--line);background:var(--pan);border-radius:12px;padding:10px 14px;cursor:pointer}
+button:active{filter:brightness(1.3)}
+button:disabled{opacity:.35;pointer-events:none}
+button.pri{background:var(--acc);color:#1b1200;border:0;font-weight:800}
+input{font:inherit;color:var(--tx);background:#0a1a2b;border:1px solid var(--line);border-radius:10px;padding:12px;width:100%;-webkit-user-select:text;user-select:text}
+.scr{display:none;height:100%;flex-direction:column}
+.scr.on{display:flex}
+/* LOBBY */
+#lobby{align-items:center;justify-content:center;padding:20px;overflow:auto}
+#lobby .card{width:min(420px,100%);background:rgba(15,34,54,.85);border:1px solid var(--line);border-radius:18px;padding:20px}
+#lobby h1{margin:0 0 4px;font-size:26px;letter-spacing:.02em}
+#lobby .sub{color:var(--mut);margin:0 0 16px;font-size:14px}
+#lobby label{display:block;color:var(--mut);font-size:12px;text-transform:uppercase;letter-spacing:.06em;margin:14px 0 6px}
+.row{display:flex;gap:8px;align-items:center}
+.row>*{flex:1}
+.seg{display:flex;gap:6px}.seg button{flex:1;padding:9px}.seg button.on{background:var(--acc);color:#1b1200;border-color:var(--acc);font-weight:800}
+#codeBig{font:800 44px/1 ui-monospace,Menlo,monospace;letter-spacing:.18em;text-align:center;margin:10px 0;color:var(--acc)}
+.note{color:var(--mut);font-size:13px;line-height:1.45}
+#lobStatus{margin-top:12px;min-height:20px;color:var(--mut);font-size:13.5px;text-align:center}
+/* GIOCO */
+#top{display:flex;align-items:center;gap:8px;padding:8px 10px;flex-wrap:wrap}
+#turnBox{flex:1;font-weight:800;font-size:16px;padding:8px 12px;border-radius:12px;background:var(--pan);border:1px solid var(--line);text-align:center}
+#turnBox.me{background:linear-gradient(90deg,#7a4a00,#b36b00);border-color:var(--acc)}
+#turnBox small{display:block;font-weight:500;font-size:12.5px;color:#ffe3ad}
+#turnBox:not(.me) small{color:var(--mut)}
+#net{font-size:12px;padding:5px 9px;border-radius:999px;border:1px solid var(--line);white-space:nowrap}
+#net.ok{border-color:var(--grn);color:#a8f0cf}#net.bad{border-color:var(--red);color:#ffb3b3}
+#tabs{display:flex;gap:6px;padding:0 10px 6px}
+#tabs button{flex:1;padding:8px}#tabs button.on{background:#1b3a5c;border-color:#3b6a99;font-weight:700}
+#area{flex:1;display:flex;gap:18px;justify-content:center;align-items:flex-start;padding:4px 10px;min-height:0;overflow:auto}
+.side{display:none;flex-direction:column;align-items:center}
+.side.on{display:flex}
+.side h3{margin:0 0 6px;font-size:14px;color:var(--mut);font-weight:600;letter-spacing:.04em;text-transform:uppercase}
+.bwrap{position:relative;padding:16px 0 0 18px;--bs:min(calc(100vw - 40px),calc(100vh - 290px),560px)}
+.board{position:relative;width:var(--bs);height:var(--bs);display:grid;grid-template:repeat(12,1fr)/repeat(12,1fr);border-radius:8px;overflow:hidden;
+  background:linear-gradient(160deg,var(--sea2),var(--sea1));box-shadow:0 8px 30px rgba(0,0,0,.45),inset 0 0 0 1px rgba(255,255,255,.08)}
+.board::before{content:"";position:absolute;inset:-50%;pointer-events:none;opacity:.22;will-change:transform;
+  background:repeating-radial-gradient(ellipse at 30% 40%,transparent 0 14px,rgba(255,255,255,.35) 15px,transparent 17px 30px);animation:waves 14s linear infinite}
+.enemy .board{background:linear-gradient(160deg,#0f3d52,#0a2a40)}
+@keyframes waves{from{transform:translate(0,0) rotate(0)}to{transform:translate(8%,6%) rotate(8deg)}}
+.cell{border-right:1px solid rgba(255,255,255,.07);border-bottom:1px solid rgba(255,255,255,.07);position:relative;z-index:1}
+.enemy.can .cell:hover{background:rgba(255,176,32,.22);cursor:crosshair}
+.cell.tgt{background:rgba(54,211,153,.28);box-shadow:inset 0 0 0 2px rgba(54,211,153,.7);cursor:pointer}
+.cell.bad{background:rgba(255,77,77,.25)}
+.lab{position:absolute;font-size:10.5px;color:var(--mut);transform:translate(-50%,-50%);pointer-events:none}
+.layer{position:absolute;inset:0;pointer-events:none;z-index:2}
+.unit{position:absolute;transition:left .45s ease,top .45s ease,transform .45s ease;filter:drop-shadow(0 3px 3px rgba(0,0,0,.45))}
+.unit.sel svg{filter:drop-shadow(0 0 5px #ffd36b) drop-shadow(0 0 2px #fff)}
+.unit.sunk{opacity:.55;filter:grayscale(.7) drop-shadow(0 2px 2px rgba(0,0,0,.4))}
+.unit svg{width:100%;height:100%;display:block;overflow:visible}
+.plane svg{animation:bob 2.2s ease-in-out infinite}
+@keyframes bob{0%,100%{transform:translateY(-2%) scale(1)}50%{transform:translateY(2%) scale(.96)}}
+.fire{animation:flick .5s ease-in-out infinite alternate;transform-origin:center}
+@keyframes flick{from{opacity:.75}to{opacity:1}}
+.mk{position:absolute;display:flex;align-items:center;justify-content:center;transition:opacity .4s}
+.mk i{display:block;border-radius:50%}
+.mk.miss i{width:34%;height:34%;border:2px solid rgba(255,255,255,.85);background:rgba(255,255,255,.12)}
+.mk.hit i,.mk.sunk i{width:56%;height:56%;background:radial-gradient(circle,#fff6c2 0,#ffb020 35%,#ff4d4d 65%,transparent 72%)}
+.mk.wreck i{width:40%;height:40%;background:none;border:0}
+.mk.wreck::after{content:"✕";color:#bbb;font-weight:900}
+.mk.fresh{animation:pop .5s ease-out}
+@keyframes pop{0%{transform:scale(2.2);opacity:0}60%{transform:scale(.9);opacity:1}100%{transform:scale(1)}}
+.boom{position:absolute;border-radius:50%;pointer-events:none;z-index:4;animation:boom .7s ease-out forwards}
+@keyframes boom{0%{transform:scale(.2);opacity:1}100%{transform:scale(2.6);opacity:0}}
+.aim{position:absolute;z-index:4;border:3px solid var(--acc);border-radius:50%;animation:aim .6s ease-in-out infinite alternate;pointer-events:none}
+@keyframes aim{from{transform:scale(.7)}to{transform:scale(1.05)}}
+#ctrl{display:flex;flex-wrap:wrap;gap:6px;justify-content:center;padding:8px 10px;min-height:56px;align-items:center}
+#ctrl .chip{padding:7px 10px;font-size:13px;border-radius:10px}
+#ctrl .chip.on{border-color:var(--acc);background:#3a2a07}
+#ctrl .chip.done{opacity:.55}
+#ctrl .ar{width:48px;height:44px;font-size:20px;padding:0}
+#log{font-size:13px;color:#c9d8e8;padding:0 12px 8px;text-align:center;min-height:22px}
+#over{position:fixed;inset:0;z-index:30;display:none;flex-direction:column;align-items:center;justify-content:center;background:rgba(3,10,18,.82);text-align:center;padding:20px}
+#over h2{font-size:42px;margin:0 0 8px}
+#over p{color:var(--mut)}
+#over .row{gap:10px;margin-top:14px}
+#toast{position:fixed;left:50%;top:44%;transform:translate(-50%,-50%);z-index:40;background:rgba(0,0,0,.85);border:1px solid #444;border-radius:14px;padding:14px 20px;font-size:22px;font-weight:800;display:none;text-align:center;max-width:88%}
+@media (min-width:900px){
+  #tabs{display:none}
+  .side{display:flex!important}
+  .bwrap{--bs:min(calc(50vw - 70px),calc(100vh - 230px),600px)}
+}
+</style>
+</head>
+<body>
+
+<section class="scr on" id="lobby">
+  <div class="card">
+    <h1>⚓ Battaglia Navale e Aerea</h1>
+    <p class="sub">Due giocatori, due dispositivi. Navi e aerei si possono spostare durante la partita.</p>
+    <label>Il tuo nome</label>
+    <input id="name" maxlength="16" autocomplete="off">
+    <div id="lobMain">
+      <label>Colpi per turno (decide chi crea)</label>
+      <div class="seg" id="segShots"><button data-v="1">1</button><button data-v="2" class="on">2</button><button data-v="3">3</button></div>
+      <button class="pri" id="bHost" style="width:100%;margin-top:16px;padding:16px;font-size:17px">Crea partita</button>
+      <label>Oppure entra con il codice</label>
+      <div class="row"><input id="code" maxlength="5" placeholder="ABCDE" autocapitalize="characters" style="text-transform:uppercase;letter-spacing:.2em;font-weight:700"><button id="bJoin" style="flex:0 0 auto;padding:12px 18px">Entra</button></div>
+    </div>
+    <div id="lobWait" style="display:none">
+      <p class="note" style="text-align:center;margin:14px 0 0">Codice della partita:</p>
+      <div id="codeBig">-----</div>
+      <button class="pri" id="bShare" style="width:100%;padding:14px">Invia il link all’avversario</button>
+      <p class="note" style="text-align:center">Oppure digli il codice: lo inserisce in “Entra”.</p>
+      <button id="bCancel" style="width:100%">Annulla</button>
+    </div>
+    <div id="lobStatus"></div>
+  </div>
+</section>
+
+<section class="scr" id="game">
+  <div id="top"><div id="turnBox">—</div><span id="net">● collegato</span></div>
+  <div id="tabs"><button id="tEnemy">🎯 Mare nemico</button><button id="tOwn">🚢 La mia flotta</button></div>
+  <div id="area">
+    <div class="side enemy" id="sEnemy"><h3 id="hEnemy">Mare nemico</h3><div class="bwrap" id="wEnemy"></div></div>
+    <div class="side own" id="sOwn"><h3>La mia flotta</h3><div class="bwrap" id="wOwn"></div></div>
+  </div>
+  <div id="ctrl"></div>
+  <div id="log"></div>
+</section>
+
+<div id="over"><h2 id="oTitle"></h2><p id="oSub"></p><div class="row"><button class="pri" id="bAgain">Rivincita</button><button id="bQuit">Esci</button></div></div>
+<div id="toast"></div>
+
+<script>
+'use strict';
+const $=s=>document.querySelector(s);
+const N=12,LET='ABCDEFGHIJKL';
+const FLEET=[
+  {id:'PA',name:'Portaerei',len:5,kind:'nave',f:1},
+  {id:'CO',name:'Corazzata',len:4,kind:'nave',f:1},
+  {id:'IN',name:'Incrociatore',len:3,kind:'nave'},
+  {id:'SM',name:'Sottomarino',len:3,kind:'nave'},
+  {id:'CT',name:'Cacciatorpediniere',len:2,kind:'nave'},
+  {id:'A1',name:'Caccia 1',len:1,kind:'aereo'},
+  {id:'A2',name:'Caccia 2',len:1,kind:'aereo'},
+  {id:'A3',name:'Caccia 3',len:1,kind:'aereo'}];
+const PLANE_RANGE=2;
+const destr=u=>u.kind==='aereo'?'ABBATTUTO':(u.f?'AFFONDATA':'AFFONDATO');
+const cellName=(r,c)=>LET[c]+(r+1);
+
+/* ================= stato ================= */
+let S;
+function newState(keep){
+  S={phase:'place',units:FLEET.map(f=>({...f,r:-1,c:-1,dir:'H',hits:Array(f.len).fill(false),placed:false,sunk:false,hdg:0})),
+     incoming:[],shots:[],enemySunk:[],enemyReveal:null,myTurn:false,turn:0,shotsLeft:0,moveUsed:false,sel:null,pending:null,
+     ready:false,oppReady:false,resCache:{},shotSeq:0,lastEnd:-1,
+     shotsPer:keep?keep.shotsPer:2,isHost:keep?keep.isHost:false,oppName:keep?keep.oppName:'Avversario'};
+}
+newState();
+
+/* ================= geometria ================= */
+function cells(u,r=u.r,c=u.c,dir=u.dir){const a=[];for(let i=0;i<u.len;i++)a.push(dir==='H'?[r,c+i]:[r+i,c]);return a;}
+function unitAt(r,c,except){return S.units.find(u=>u.placed&&u!==except&&cells(u).some(([a,b])=>a===r&&b===c));}
+function fits(u,r,c,dir){return cells(u,r,c,dir).every(([a,b])=>a>=0&&b>=0&&a<N&&b<N&&!unitAt(a,b,u));}
+function randomPlace(){S.units.forEach(u=>{u.placed=false;});S.units.forEach(u=>{for(let k=0;k<500;k++){const dir=Math.random()<.5?'H':'V',r=Math.floor(Math.random()*N),c=Math.floor(Math.random()*N);if(fits(u,r,c,dir)){Object.assign(u,{r,c,dir,placed:true});break;}}});}
+
+/* ================= grafica unità ================= */
+function shipSVG(u,enemy){
+  const L=u.len*100,hull=enemy?'#7a2b2b':(u.sunk?'#56616d':'#9aa8b6'),deck=enemy?'#5a1f1f':(u.sunk?'#3e4752':'#6d7c8b');
+  let s=`<svg viewBox="0 0 ${L} 100" preserveAspectRatio="none"><path d="M12,28 L${L-48},26 Q${L-4},50 ${L-48},74 L12,72 Q2,50 12,28Z" fill="${hull}" stroke="#1c2733" stroke-width="3"/>`;
+  if(u.id==='PA'){s+=`<rect x="22" y="36" width="${L-90}" height="28" rx="4" fill="${deck}"/><line x1="30" y1="50" x2="${L-80}" y2="50" stroke="#e8edf2" stroke-width="3" stroke-dasharray="14 10"/><rect x="${L*0.55}" y="20" width="34" height="18" rx="3" fill="#cfd8e1" stroke="#1c2733" stroke-width="2"/>`;}
+  else if(u.id==='SM'){s+=`<rect x="${L*0.38}" y="36" width="${L*0.18}" height="28" rx="10" fill="${deck}" stroke="#1c2733" stroke-width="2"/><line x1="${L*0.47}" y1="36" x2="${L*0.47}" y2="18" stroke="#1c2733" stroke-width="4"/>`;}
+  else{for(let i=0;i<u.len;i++){const cx=i*100+50;if(i===u.len-1){s+=`<circle cx="${cx-14}" cy="50" r="11" fill="${deck}" stroke="#1c2733" stroke-width="2"/><line x1="${cx-14}" y1="50" x2="${cx+18}" y2="50" stroke="#1c2733" stroke-width="5"/>`;}else if(i===Math.floor(u.len/2)-(u.len%2?0:1)){s+=`<rect x="${cx-22}" y="34" width="44" height="32" rx="5" fill="#cfd8e1" stroke="#1c2733" stroke-width="2"/>`;}else{s+=`<circle cx="${cx}" cy="50" r="12" fill="${deck}" stroke="#1c2733" stroke-width="2"/><line x1="${cx}" y1="50" x2="${cx+30}" y2="50" stroke="#1c2733" stroke-width="5"/>`;}}}
+  if(!enemy)u.hits.forEach((h,i)=>{if(h)s+=`<g class="fire"><circle cx="${i*100+50}" cy="50" r="26" fill="#ff4d4d" opacity=".55"/><circle cx="${i*100+50}" cy="50" r="15" fill="#ffb020"/><circle cx="${i*100+50}" cy="47" r="7" fill="#fff3b0"/></g>`;});
+  return s+'</svg>';
+}
+function planeSVG(u,enemy){
+  const b=enemy?'#8a2f2f':(u.sunk?'#56616d':'#d8e2ec'),w=enemy?'#6a2323':(u.sunk?'#444d57':'#9fb3c7');
+  let s=`<svg viewBox="0 0 100 100"><path d="M50,6 L56,30 L92,52 L92,60 L56,50 L54,78 L66,88 L66,94 L50,89 L34,94 L34,88 L46,78 L44,50 L8,60 L8,52 L44,30Z" fill="${b}" stroke="#1c2733" stroke-width="3" stroke-linejoin="round"/><path d="M50,14 L53,30 L47,30Z" fill="${w}"/>`;
+  if(!enemy&&u.hits[0])s+=`<g class="fire"><circle cx="50" cy="50" r="24" fill="#ff4d4d" opacity=".6"/><circle cx="50" cy="50" r="13" fill="#ffb020"/></g>`;
+  return s+'</svg>';
+}
+function placeEl(el,u){
+  const p=100/N;
+  if(u.kind==='aereo'){el.style.left=u.c*p+'%';el.style.top=u.r*p+'%';el.style.width=p+'%';el.style.height=p+'%';el.style.transform=`rotate(${u.hdg||0}deg)`;el.style.transformOrigin='50% 50%';}
+  else if(u.dir==='H'){el.style.left=u.c*p+'%';el.style.top=u.r*p+'%';el.style.width=u.len*p+'%';el.style.height=p+'%';el.style.transformOrigin='0 0';el.style.transform='none';}
+  else{el.style.left=(u.c+1)*p+'%';el.style.top=u.r*p+'%';el.style.width=u.len*p+'%';el.style.height=p+'%';el.style.transformOrigin='0 0';el.style.transform='rotate(90deg)';}
+}
+
+/* ================= tavole ================= */
+const boards={};
+function buildBoard(key,wrap){
+  wrap.innerHTML='';const b=document.createElement('div');b.className='board';
+  for(let r=0;r<N;r++)for(let c=0;c<N;c++){const d=document.createElement('div');d.className='cell';d.dataset.r=r;d.dataset.c=c;b.appendChild(d);}
+  const units=document.createElement('div');units.className='layer';const marks=document.createElement('div');marks.className='layer';
+  b.appendChild(marks);b.appendChild(units);wrap.appendChild(b);
+  for(let i=0;i<N;i++){const t=document.createElement('div');t.className='lab';t.textContent=LET[i];t.style.left=`calc(18px + var(--bs) * ${(i+.5)/N})`;t.style.top='8px';wrap.appendChild(t);
+    const l=document.createElement('div');l.className='lab';l.textContent=i+1;l.style.left='9px';l.style.top=`calc(16px + var(--bs) * ${(i+.5)/N})`;wrap.appendChild(l);}
+  b.addEventListener('click',e=>{const t=e.target.closest('.cell');if(t)onCell(key,+t.dataset.r,+t.dataset.c);});
+  boards[key]={b,units,marks,els:{}};
+}
+function markHTML(list,fresh){
+  const p=100/N;
+  return list.map((m,i)=>{const age=S.turn-m.turn;const op=m.turn===undefined?1:age<=1?1:age<=3?.7:age<=5?.5:.33;
+    return `<div class="mk ${m.res}${fresh&&i===list.length-1?' fresh':''}" style="left:${m.c*p}%;top:${m.r*p}%;width:${p}%;height:${p}%;opacity:${op}"><i></i></div>`;}).join('');
+}
+let freshOwn=false,freshEnemy=false;
+function render(){
+  // propria
+  const O=boards.own;
+  S.units.forEach(u=>{let el=O.els[u.id];
+    if(!u.placed){if(el){el.remove();delete O.els[u.id];}return;}
+    if(!el){el=document.createElement('div');O.units.appendChild(el);O.els[u.id]=el;}
+    el.className='unit'+(u.kind==='aereo'?' plane':'')+(u.sunk?' sunk':'')+(S.sel===u?' sel':'');
+    const html=u.kind==='aereo'?planeSVG(u):shipSVG(u);if(el._h!==html){el.innerHTML=html;el._h=html;}
+    placeEl(el,u);});
+  O.marks.innerHTML=markHTML(S.incoming.filter(m=>m.res==='miss'||m.res==='wreck'),freshOwn);freshOwn=false;
+  // nemico
+  const E=boards.enemy;
+  const shown=S.enemyReveal||S.enemySunk;
+  E.units.innerHTML='';
+  shown.forEach(x=>{const u={...x,hits:Array(x.len).fill(false),sunk:!!x.sunkFlag};const el=document.createElement('div');el.className='unit'+(x.kind==='aereo'?' plane':'')+(x.sunkFlag?' sunk':'');el.innerHTML=x.kind==='aereo'?planeSVG(u,true):shipSVG(u,true);placeEl(el,u);E.units.appendChild(el);});
+  E.marks.innerHTML=markHTML(S.shots,freshEnemy);freshEnemy=false;
+  // evidenzia mosse aereo
+  O.b.querySelectorAll('.cell.tgt').forEach(c=>c.classList.remove('tgt'));
+  if(S.phase==='play'&&S.sel&&S.sel.kind==='aereo'&&canMove()){
+    for(let dr=-PLANE_RANGE;dr<=PLANE_RANGE;dr++)for(let dc=-PLANE_RANGE;dc<=PLANE_RANGE;dc++){if(!dr&&!dc)continue;const r=S.sel.r+dr,c=S.sel.c+dc;if(fits(S.sel,r,c,'H'))O.b.children[r*N+c].classList.add('tgt');}
+  }
+  $('#sEnemy').classList.toggle('can',S.phase==='play'&&S.myTurn&&!S.pending&&S.shotsLeft>0);
+  renderTop();renderCtrl();
+}
+
+/* ================= barra e controlli ================= */
+function renderTop(){
+  const tb=$('#turnBox');tb.classList.toggle('me',S.phase==='play'&&S.myTurn);
+  if(S.phase==='place')tb.innerHTML='Schiera la flotta<small>tocca un’unità, poi la casella · “Casuale” per fare prima</small>';
+  else if(S.phase==='wait')tb.innerHTML=`In attesa di ${esc(S.oppName)}…<small>sta schierando la flotta</small>`;
+  else if(S.phase==='play'){
+    if(S.myTurn)tb.innerHTML=`TOCCA A TE · colpi ${S.shotsLeft}/${S.shotsPer}<small>${S.moveUsed?'movimento usato':'puoi spostare 1 unità (La mia flotta)'} · poi spara sul mare nemico</small>`;
+    else tb.innerHTML=`Turno di ${esc(S.oppName)}<small>la tua flotta è sotto tiro</small>`;
+  }else if(S.phase==='over')tb.innerHTML='Partita finita';
+  $('#hEnemy').textContent='Mare di '+S.oppName;
+}
+function renderCtrl(){
+  const C=$('#ctrl');C.innerHTML='';
+  const btn=(t,fn,cls='',dis=false)=>{const b=document.createElement('button');b.innerHTML=t;b.className=cls;b.disabled=dis;b.onclick=fn;C.appendChild(b);return b;};
+  if(S.phase==='place'){
+    S.units.forEach(u=>btn((u.kind==='aereo'?'✈︎ ':'🚢 ')+u.name+(u.len>1?` (${u.len})`:''),()=>{S.sel=u;render();},'chip'+(S.sel===u?' on':'')+(u.placed?' done':'')));
+    btn('⟳ Ruota',()=>{const u=S.sel;if(!u||u.kind==='aereo')return;const nd=u.dir==='H'?'V':'H';if(!u.placed)u.dir=nd;else if(fits(u,u.r,u.c,nd))u.dir=nd;else toast('Non c’è spazio per ruotare');render();},'',!S.sel||S.sel.kind==='aereo');
+    btn('🎲 Casuale',()=>{randomPlace();S.sel=null;sfx.click();render();});
+    btn('✔ Pronto',()=>{S.phase='wait';S.ready=true;S.sel=null;send({t:'ready'});checkStart();render();},'pri',!S.units.every(u=>u.placed));
+    return;
+  }
+  if(S.phase==='play'&&S.myTurn&&S.sel&&canMove()){
+    const u=S.sel;
+    if(u.kind==='nave'){
+      btn('↑',()=>moveShip(-1,0),'ar');btn('↓',()=>moveShip(1,0),'ar');btn('←',()=>moveShip(0,-1),'ar');btn('→',()=>moveShip(0,1),'ar');btn('⟳',rotateShip,'ar');
+    }else{const s=document.createElement('span');s.className='note';s.textContent=`Tocca una casella verde (fino a ${PLANE_RANGE} caselle)`;C.appendChild(s);}
+    btn('Annulla',()=>{S.sel=null;render();});
+  }else if(S.phase==='play'&&S.myTurn){
+    const s=document.createElement('span');s.className='note';
+    s.textContent=canMove()?'Per spostare: apri “La mia flotta” e tocca una nave o un aereo':'Spara sul mare nemico';C.appendChild(s);
+  }
+}
+function esc(s){return String(s).replace(/[<>&"]/g,c=>({'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;'}[c]));}
+let toastT;function toast(t,ms=1500){const e=$('#toast');e.textContent=t;e.style.display='block';clearTimeout(toastT);toastT=setTimeout(()=>e.style.display='none',ms);}
+function log(t){$('#log').textContent=t;}
+
+/* ================= tab (telefono) ================= */
+let tab='enemy';
+function setTab(t){tab=t;$('#tEnemy').classList.toggle('on',t==='enemy');$('#tOwn').classList.toggle('on',t==='own');$('#sEnemy').classList.toggle('on',t==='enemy');$('#sOwn').classList.toggle('on',t==='own');}
+$('#tEnemy').onclick=()=>setTab('enemy');$('#tOwn').onclick=()=>setTab('own');
+
+/* ================= interazione ================= */
+function canMove(){return S.phase==='play'&&S.myTurn&&!S.moveUsed&&S.shotsLeft>0&&!S.pending;}
+function onCell(key,r,c){
+  unlockAudio();
+  if(key==='own'){
+    if(S.phase==='place'){
+      const hit=unitAt(r,c);
+      if(S.sel&&(!hit||hit===S.sel)){
+        if(fits(S.sel,r,c,S.sel.dir)){Object.assign(S.sel,{r,c,placed:true});sfx.click();const nx=S.units.find(u=>!u.placed);S.sel=nx||null;}
+        else toast('Non entra qui');
+      }else if(hit){S.sel=hit;}
+      render();return;
+    }
+    if(S.phase==='play'&&canMove()){
+      if(S.sel&&S.sel.kind==='aereo'&&boards.own.b.children[r*N+c].classList.contains('tgt')){movePlane(r,c);return;}
+      const u=unitAt(r,c);if(u&&!u.sunk){S.sel=S.sel===u?null:u;render();}
+    }
+    return;
+  }
+  if(key==='enemy'&&S.phase==='play'&&S.myTurn&&!S.pending&&S.shotsLeft>0)fire(r,c);
+}
+function afterMove(u){S.moveUsed=true;S.sel=null;sfx.move();send({t:'moved',kind:u.kind});log(`Hai spostato ${u.name}`);render();}
+function moveShip(dr,dc){const u=S.sel;if(fits(u,u.r+dr,u.c+dc,u.dir)){u.r+=dr;u.c+=dc;afterMove(u);}else toast('Bloccato');}
+function rotateShip(){const u=S.sel,k=Math.floor(u.len/2),[pr,pc]=cells(u)[k];const nd=u.dir==='H'?'V':'H';const r=nd==='V'?pr-k:pr,c=nd==='V'?pc:pc-k;if(fits(u,r,c,nd)){Object.assign(u,{r,c,dir:nd});afterMove(u);}else toast('Non c’è spazio per ruotare');}
+function movePlane(r,c){const u=S.sel;u.hdg=Math.round(Math.atan2(c-u.c,-(r-u.r))*180/Math.PI);u.r=r;u.c=c;afterMove(u);}
+
+/* ================= colpi ================= */
+function fire(r,c){
+  S.shotSeq++;const id=S.turn+'-'+S.shotSeq;S.pending={id,r,c};S.sel=null;
+  const p=100/N,a=document.createElement('div');a.className='aim';a.id='aim';a.style.cssText=`left:${c*p}%;top:${r*p}%;width:${p}%;height:${p}%`;boards.enemy.b.appendChild(a);
+  sfx.fire();send({t:'shot',id,r,c});render();
+}
+function resolveShot(m){
+  if(S.resCache[m.id])return S.resCache[m.id];
+  const {r,c}=m;const u=unitAt(r,c);let res='miss',unit=null;
+  if(u&&u.sunk)res='wreck';
+  else if(u){const i=cells(u).findIndex(([a,b])=>a===r&&b===c);const dup=u.hits[i];u.hits[i]=true;res='hit';
+    if(u.hits.every(Boolean)){u.sunk=true;res='sunk';unit={id:u.id,name:u.name,kind:u.kind,f:u.f,len:u.len,r:u.r,c:u.c,dir:u.dir,hdg:u.hdg,sunkFlag:true};}
+    else if(dup)res='hit';}
+  const lost=S.units.every(x=>x.sunk);
+  const out={t:'res',id:m.id,r,c,res,unit,lost,name:u?u.name:null,kind:u?u.kind:null};
+  S.resCache[m.id]=out;
+  S.incoming.push({r,c,res,turn:S.turn});freshOwn=true;
+  if(res==='miss'){sfx.splash();log(`${S.oppName} spara su ${cellName(r,c)}: acqua`);}
+  else if(res==='wreck'){log(`${S.oppName} colpisce un relitto in ${cellName(r,c)}`);}
+  else{sfx.boom();flash('own',r,c);log(res==='sunk'?`${S.oppName}: ${u.name} ${destr(u).toLowerCase()}!`:`${S.oppName} ha colpito: ${u.name} in ${cellName(r,c)}`);if(res==='sunk')toast(`💥 ${u.name} ${destr(u)}`);}
+  if(lost)setTimeout(()=>gameOver(false),900);
+  render();return out;
+}
+function onResult(m){
+  if(!S.pending||S.pending.id!==m.id)return;
+  S.pending=null;const a=$('#aim');if(a)a.remove();
+  S.shots.push({r:m.r,c:m.c,res:m.res,turn:S.turn});freshEnemy=true;
+  if(m.res==='miss'){sfx.splash();log(`${cellName(m.r,m.c)}: acqua`);}
+  else if(m.res==='wreck'){log(`${cellName(m.r,m.c)}: relitto già distrutto`);}
+  else{sfx.boom();flash('enemy',m.r,m.c);
+    if(m.res==='sunk'){S.enemySunk.push(m.unit);toast(`${m.unit.kind==='aereo'?'✈︎':'🚢'} ${m.unit.name} ${destr(m.unit)}!`,1800);log(`${m.unit.name} ${destr(m.unit).toLowerCase()}!`);}
+    else{toast('🔥 COLPITO!',900);log(`${cellName(m.r,m.c)}: colpito ${m.kind==='aereo'?'un aereo':'una nave'}!`);}}
+  S.shotsLeft--;
+  if(m.lost){render();setTimeout(()=>gameOver(true),900);return;}
+  if(S.shotsLeft<=0)endTurn();
+  render();
+}
+function endTurn(){S.lastEnd=S.turn;send({t:'endturn',turn:S.turn});S.myTurn=false;S.sel=null;S.turn++;setTimeout(()=>{if(!S.myTurn&&S.phase==='play')setTab('own');},1200);}
+function beginMyTurn(){S.myTurn=true;S.shotsLeft=S.shotsPer;S.moveUsed=false;S.shotSeq=0;sfx.turn();toast('🎯 Tocca a te',1000);setTab('enemy');render();}
+function flash(key,r,c){const p=100/N,d=document.createElement('div');d.className='boom';d.style.cssText=`left:${c*p}%;top:${r*p}%;width:${p}%;height:${p}%;background:radial-gradient(circle,#fff6c2,#ffb020 40%,rgba(255,77,77,.6) 60%,transparent 70%)`;boards[key].b.appendChild(d);setTimeout(()=>d.remove(),800);}
+
+/* ================= fine partita ================= */
+function gameOver(win){
+  if(S.phase==='over')return;S.phase='over';S.myTurn=false;
+  send({t:'reveal',units:S.units.map(u=>({id:u.id,name:u.name,kind:u.kind,len:u.len,r:u.r,c:u.c,dir:u.dir,hdg:u.hdg,sunkFlag:u.sunk}))});
+  $('#oTitle').textContent=win?'🏆 HAI VINTO!':'💀 HAI PERSO';
+  $('#oSub').textContent=win?`Hai distrutto tutta la flotta di ${S.oppName}.`:`${S.oppName} ha distrutto tutta la tua flotta.`;
+  $('#over').style.display='flex';win?sfx.win():sfx.lose();render();
+}
+$('#bAgain').onclick=()=>{send({t:'again'});restart();};
+$('#bQuit').onclick=()=>location.reload();
+function restart(){const keep={shotsPer:S.shotsPer,isHost:S.isHost,oppName:S.oppName};newState(keep);$('#over').style.display='none';setTab('own');render();log('Nuova partita: schiera la flotta');}
+function checkStart(){
+  if(S.isHost&&S.ready&&S.oppReady&&S.phase==='wait'){const first=Math.random()<.5?'host':'guest';send({t:'start',first});startPlay(first==='host');}
+}
+function startPlay(meFirst){S.phase='play';S.turn=0;log(meFirst?'Inizi tu!':`Inizia ${S.oppName}`);if(meFirst)beginMyTurn();else{S.myTurn=false;setTab('own');render();}}
+
+/* ================= messaggi ================= */
+function onMsg(m){
+  if(!m||typeof m!=='object')return;
+  switch(m.t){
+    case 'hello':
+      S.oppName=String(m.name||'Avversario').slice(0,16);
+      if(S.isHost)send({t:'settings',shotsPer:S.shotsPer});
+      if(!inGame)enterGame();else{netUI(true);resync();}
+      break;
+    case 'settings':S.shotsPer=Math.min(3,Math.max(1,m.shotsPer|0));render();break;
+    case 'ready':S.oppReady=true;checkStart();break;
+    case 'start':startPlay(m.first==='guest');break;
+    case 'shot':if(S.phase==='play'){const out=resolveShot(m);send(out);}break;
+    case 'res':onResult(m);break;
+    case 'moved':log(`${S.oppName} ha spostato ${m.kind==='aereo'?'un aereo':'una nave'}`);break;
+    case 'endturn':if(m.turn===S.turn&&S.phase==='play'&&!S.myTurn){S.turn++;beginMyTurn();}break;
+    case 'reveal':S.enemyReveal=m.units;if(S.phase!=='over'){const allSunk=m.units.every(u=>u.sunkFlag);gameOver(allSunk);}render();break;
+    case 'again':if(S.phase==='over')restart();break;
+  }
+}
+function resync(){ // dopo una riconnessione rimanda ciò che può essersi perso
+  if(S.pending)send({t:'shot',id:S.pending.id,r:S.pending.r,c:S.pending.c});
+  if(S.phase==='play'&&!S.myTurn&&S.lastEnd===S.turn-1)send({t:'endturn',turn:S.lastEnd});
+  if(S.ready)send({t:'ready'});
+}
+
+/* ================= rete ================= */
+let peer=null,conn=null,code='',inGame=false,retryT=null;
+const ALPH='ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+function genCode(){let s='';for(let i=0;i<5;i++)s+=ALPH[Math.floor(Math.random()*ALPH.length)];return s;}
+function send(m){try{if(conn&&conn.open)conn.send(m);}catch(_){}}
+function netUI(ok,t){const n=$('#net');n.className=ok?'ok':'bad';n.textContent=ok?'● collegato':('● '+(t||'disconnesso'));}
+function lob(t){$('#lobStatus').textContent=t;}
+function myName(){const n=($('#name').value||'').trim()||'Giocatore';try{localStorage.setItem('bn-name',n);}catch(_){}return n;}
+function attach(c){
+  conn=c;
+  c.on('open',()=>{netUI(true);send({t:'hello',name:myName()});});
+  c.on('data',onMsg);
+  c.on('close',()=>{netUI(false);if(inGame&&!S.isHost)scheduleRetry();});
+  c.on('error',()=>netUI(false,'errore'));
+}
+function hostGame(){
+  unlockAudio();myName();S.isHost=true;code=genCode();lob('Creo la partita…');
+  if(peer)peer.destroy();
+  peer=new Peer('bnav-'+code,{debug:0});
+  peer.on('open',()=>{$('#lobMain').style.display='none';$('#lobWait').style.display='block';$('#codeBig').textContent=code;lob('In attesa dell’avversario…');});
+  peer.on('connection',c=>{if(conn&&conn.open&&conn!==c){c.on('open',()=>c.close());return;}attach(c);});
+  peer.on('disconnected',()=>{try{peer.reconnect();}catch(_){}});
+  peer.on('error',e=>{if(e.type==='unavailable-id'){hostGame();}else{lob('Errore di rete: '+e.type+'. Controlla la connessione e riprova.');if(inGame)netUI(false,'rete');}});
+}
+function joinGame(c){
+  unlockAudio();myName();S.isHost=false;code=c.toUpperCase().replace(/[^A-Z0-9]/g,'');
+  if(code.length!==5){lob('Il codice è di 5 caratteri');return;}
+  lob('Mi collego…');if(peer)peer.destroy();
+  peer=new Peer({debug:0});
+  peer.on('open',()=>attach(peer.connect('bnav-'+code,{reliable:true})));
+  peer.on('disconnected',()=>{try{peer.reconnect();}catch(_){}});
+  peer.on('error',e=>{if(e.type==='peer-unavailable'){if(inGame){netUI(false,'avversario assente');scheduleRetry();}else lob('Partita non trovata: controlla il codice (o chi l’ha creata ha chiuso la pagina).');}else{lob('Errore di rete: '+e.type);if(inGame){netUI(false,'rete');scheduleRetry();}}});
+}
+function scheduleRetry(){clearTimeout(retryT);retryT=setTimeout(()=>{if(conn&&conn.open)return;try{if(peer&&!peer.destroyed){if(peer.disconnected)peer.reconnect();attach(peer.connect('bnav-'+code,{reliable:true}));}}catch(_){}scheduleRetry();},4000);}
+
+/* trasporto locale per prova su un solo computer: apri due schede con #prova */
+function localGame(){
+  const bc=new BroadcastChannel('bnav-local');const me=Math.random().toString(36).slice(2);let open=false;
+  const fake={open:false,handlers:{},on(ev,fn){this.handlers[ev]=fn;},send(m){bc.postMessage({from:me,m});}};
+  bc.onmessage=e=>{const d=e.data;if(d.from===me)return;if(d.m&&d.m.t==='__hi'){if(!open){open=true;fake.open=true;bc.postMessage({from:me,m:{t:'__hi'}});S.isHost=me<d.from;fake.handlers.open&&fake.handlers.open();}return;}fake.handlers.data&&fake.handlers.data(d.m);};
+  attach(fake);bc.postMessage({from:me,m:{t:'__hi'}});lob('Prova locale: apri un’altra scheda con #prova');
+}
+
+/* ================= ingresso nel gioco ================= */
+function enterGame(){
+  inGame=true;history.replaceState(null,'',location.pathname);
+  show('game');buildBoard('enemy',$('#wEnemy'));buildBoard('own',$('#wOwn'));setTab('own');netUI(true);
+  log(`Collegato con ${S.oppName}. Schiera la flotta.`);render();sfx.turn();
+}
+function show(id){document.querySelectorAll('.scr').forEach(s=>s.classList.toggle('on',s.id===id));}
+
+/* ================= suoni ================= */
+let actx;
+function unlockAudio(){try{actx=actx||new (window.AudioContext||window.webkitAudioContext)();if(actx.state!=='running')actx.resume();}catch(_){}}
+function noise(dur,f,type,vol){if(!actx)return;const n=actx.sampleRate*dur,buf=actx.createBuffer(1,n,actx.sampleRate),d=buf.getChannelData(0);for(let i=0;i<n;i++)d[i]=(Math.random()*2-1)*Math.pow(1-i/n,2);const s=actx.createBufferSource();s.buffer=buf;const fl=actx.createBiquadFilter();fl.type=type;fl.frequency.value=f;const g=actx.createGain();g.gain.value=vol;s.connect(fl).connect(g).connect(actx.destination);s.start();}
+function tone(f,dur,vol=.15,type='sine',f2){if(!actx)return;const o=actx.createOscillator(),g=actx.createGain();o.type=type;o.frequency.value=f;if(f2)o.frequency.exponentialRampToValueAtTime(f2,actx.currentTime+dur);g.gain.setValueAtTime(vol,actx.currentTime);g.gain.exponentialRampToValueAtTime(.001,actx.currentTime+dur);o.connect(g).connect(actx.destination);o.start();o.stop(actx.currentTime+dur);}
+const sfx={boom:()=>{noise(.9,400,'lowpass',1.2);tone(70,.5,.4,'sine',30);},splash:()=>noise(.45,1200,'bandpass',.6),fire:()=>tone(900,.25,.12,'square',200),
+  move:()=>tone(300,.18,.12,'triangle',500),click:()=>tone(700,.06,.1),turn:()=>{tone(660,.12,.15);setTimeout(()=>tone(990,.15,.15),130);},
+  win:()=>[523,659,784,1046].forEach((f,i)=>setTimeout(()=>tone(f,.25,.2,'triangle'),i*160)),lose:()=>[392,330,262].forEach((f,i)=>setTimeout(()=>tone(f,.35,.2,'triangle'),i*220))};
+
+/* ================= lobby ================= */
+try{$('#name').value=localStorage.getItem('bn-name')||'';}catch(_){}
+document.querySelectorAll('#segShots button').forEach(b=>b.onclick=()=>{document.querySelectorAll('#segShots button').forEach(x=>x.classList.toggle('on',x===b));S.shotsPer=+b.dataset.v;});
+$('#bHost').onclick=hostGame;
+$('#bJoin').onclick=()=>joinGame($('#code').value);
+$('#code').addEventListener('keydown',e=>{if(e.key==='Enter')joinGame($('#code').value);});
+$('#bCancel').onclick=()=>location.reload();
+$('#bShare').onclick=()=>{const url=location.origin+location.pathname+'#'+code;const text=`Sfida a Battaglia Navale! Apri il link o inserisci il codice ${code}`;
+  if(navigator.share)navigator.share({title:'Battaglia Navale',text,url}).catch(()=>{});
+  else if(navigator.clipboard)navigator.clipboard.writeText(url).then(()=>lob('Link copiato: incollalo all’avversario')).catch(()=>lob(url));else lob(url);};
+(function(){const c=document.createElement('canvas');c.width=c.height=180;const g=c.getContext('2d');const gr=g.createLinearGradient(0,0,0,180);gr.addColorStop(0,'#0e4b80');gr.addColorStop(1,'#06121f');g.fillStyle=gr;g.fillRect(0,0,180,180);g.fillStyle='#ffb020';g.font='bold 110px sans-serif';g.textAlign='center';g.textBaseline='middle';g.fillText('⚓',90,96);$('#appicon').href=c.toDataURL();})();
+// avvio da link
+const h=location.hash.replace('#','');
+if(h==='prova'){if(!$('#name').value)$('#name').value='Prova'+Math.floor(Math.random()*90+10);localGame();}
+else if(/^[A-Z0-9]{5}$/i.test(h)){$('#code').value=h.toUpperCase();lob('Invito ricevuto: scrivi il tuo nome e premi “Entra”.');}
+if(typeof Peer==='undefined'&&h!=='prova')lob('Libreria di rete non caricata.');
+</script>
+</body>
+</html>
